@@ -1,0 +1,924 @@
+from __future__ import annotations
+
+import asyncio
+import logging
+import math
+from datetime import date
+
+import fastf1
+import plotext as plt
+from fastf1.plotting import get_team_color
+from rich.text import Text
+from textual.app import App, ComposeResult
+from textual.containers import Horizontal, Vertical
+from textual.widgets import Button, DataTable, Footer, Header, Label, RichLog, Select, Static
+
+
+SESSION_TYPES = [
+    ("Race", "R"),
+    ("Sprint", "S"),
+    ("Qualifying", "Q"),
+    ("Practice 1", "FP1"),
+    ("Practice 2", "FP2"),
+    ("Practice 3", "FP3"),
+]
+PRACTICE_SESSION_TYPES = {"FP1", "FP2", "FP3"}
+QUALIFYING_SESSION_TYPE = "Q"
+QUALIFYING_TIME_COLUMNS = ("Q3", "Q2", "Q1")
+POSITION_MEDALS = {
+    1: ("🥇", "gold1"),
+    2: ("🥈", "bright_white"),
+    3: ("🥉", "dark_orange"),
+}
+COMPOUND_STYLES = {
+    "SOFT": "red",
+    "MEDIUM": "yellow",
+    "HARD": "white",
+}
+COMPARE_SLOTS = ("A", "B")
+COMPARE_FALLBACK_COLORS = ("cyan", "magenta")
+
+
+class TextualLogHandler(logging.Handler):
+    def __init__(self, app: "F1ResultsApp") -> None:
+        super().__init__()
+        self.app = app
+
+    def emit(self, record: logging.LogRecord) -> None:
+        message = self.format(record)
+        try:
+            self.app.call_from_thread(self.app.write_log_message, message)
+        except RuntimeError:
+            self.app.write_log_message(message)
+
+
+class F1ResultsApp(App):
+    CSS = """
+    Screen {
+        layout: vertical;
+    }
+
+    #controls {
+        height: auto;
+        padding: 1;
+    }
+
+    Select {
+        width: 20;
+        margin-right: 1;
+    }
+
+    #event {
+        width: 36;
+    }
+
+    #status {
+        height: 3;
+        padding: 1;
+    }
+
+    #results_area {
+        height: 1fr;
+    }
+
+    #results {
+        width: 1fr;
+        height: 1fr;
+    }
+
+    #driver_details {
+        width: 64;
+        height: 1fr;
+        padding: 1;
+        border: solid green;
+    }
+
+    #comparison {
+        width: 66;
+        height: 1fr;
+        padding: 1;
+        border: solid yellow;
+    }
+
+    #compare_graph {
+        height: auto;
+    }
+
+    #compare_metrics {
+        height: auto;
+        margin-top: 1;
+    }
+
+    #log_title {
+        height: 1;
+        padding: 0 1;
+    }
+
+    #logs {
+        height: 12;
+        border: solid blue;
+    }
+    """
+
+    BINDINGS = [
+        ("q", "quit", "Quit"),
+        ("c", "toggle_compare", "Mark for compare"),
+        ("x", "clear_compare", "Clear compare"),
+    ]
+
+    def compose(self) -> ComposeResult:
+        yield Header()
+        with Horizontal(id="controls"):
+            yield Label("Event")
+            yield Select([], prompt="Loading events...", allow_blank=True, id="event", disabled=True)
+            yield Select(SESSION_TYPES, value="R", id="session_type")
+            yield Button("Load Results", variant="primary", id="load", disabled=True)
+        yield Static("Select an event, then load results.", id="status")
+        with Horizontal(id="results_area"):
+            yield DataTable(id="results")
+            details = Static("", id="driver_details")
+            details.display = False
+            yield details
+            with Vertical(id="comparison"):
+                yield Static("", id="compare_graph")
+                yield DataTable(id="compare_metrics")
+        yield Static("Logs", id="log_title")
+        yield RichLog(id="logs", markup=True, highlight=True)
+        yield Footer()
+
+    def on_mount(self) -> None:
+        self.result_rows: list[dict[str, object]] = []
+        self.current_year = date.today().year
+        self.current_event_name = ""
+        self.current_session_type = "R"
+        self.event_names: list[str] = []
+        self.compare_indexes: list[int] = []
+        self.compare_column_key = None
+        self.result_row_keys: list[object] = []
+
+        table = self.query_one("#results", DataTable)
+        table.cursor_type = "row"
+        self.query_one("#comparison", Vertical).display = False
+
+        self.log_handler = TextualLogHandler(self)
+        self.log_handler.setFormatter(
+            logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s", "%H:%M:%S")
+        )
+        self.managed_loggers = [logging.getLogger(name) for name in ("fastf1", "req", "core", "api")]
+        self.previous_logger_handlers = {
+            logger: list(logger.handlers) for logger in self.managed_loggers
+        }
+        self.previous_logger_levels = {
+            logger: logger.level for logger in self.managed_loggers
+        }
+        for logger in self.managed_loggers:
+            for handler in self.previous_logger_handlers[logger]:
+                logger.removeHandler(handler)
+            logger.addHandler(self.log_handler)
+            logger.setLevel(logging.INFO)
+
+        self.run_worker(self.load_current_year_events(), exclusive=True)
+
+    def on_unmount(self) -> None:
+        if not hasattr(self, "log_handler"):
+            return
+
+        for logger in self.managed_loggers:
+            logger.removeHandler(self.log_handler)
+            for handler in self.previous_logger_handlers[logger]:
+                logger.addHandler(handler)
+            logger.setLevel(self.previous_logger_levels[logger])
+
+    def write_log_message(self, message: str) -> None:
+        logs = self.query_one("#logs", RichLog)
+        logs.write(message)
+
+    async def load_current_year_events(self) -> None:
+        year = date.today().year
+        status = self.query_one("#status", Static)
+        event_select = self.query_one("#event", Select)
+        load_button = self.query_one("#load", Button)
+        status.update(f"Loading {year} Grand Prix list...")
+
+        try:
+            event_names = await asyncio.to_thread(load_event_names, year)
+        except Exception as exc:
+            status.update(f"Could not load {year} Grand Prix list: {exc}")
+            return
+
+        self.event_names = event_names
+        event_select.set_options([(name, name) for name in event_names])
+        if not event_names:
+            event_select.disabled = True
+            load_button.disabled = True
+            status.update(f"No {year} Grand Prix events found.")
+            return
+
+        event_select.value = event_names[0]
+        event_select.disabled = False
+        load_button.disabled = False
+        status.update(f"Select a {year} Grand Prix, then load results.")
+
+    def is_valid_event_name(self, value: object) -> bool:
+        return isinstance(value, str) and value in self.event_names
+
+    def on_select_changed(self, event: Select.Changed) -> None:
+        if event.select.id != "event" or not hasattr(self, "event_names"):
+            return
+
+        load_button = self.query_one("#load", Button)
+        load_button.disabled = not self.is_valid_event_name(event.value)
+
+    async def on_button_pressed(self, event: Button.Pressed) -> None:
+        if event.button.id != "load":
+            return
+
+        event_select = self.query_one("#event", Select)
+        session_select = self.query_one("#session_type", Select)
+        status = self.query_one("#status", Static)
+
+        year = date.today().year
+        event_value = event_select.value
+        if not self.is_valid_event_name(event_value):
+            load_button = self.query_one("#load", Button)
+            load_button.disabled = True
+            status.update("Select a Grand Prix before loading results.")
+            return
+
+        event_name = str(event_value)
+        session_type = str(session_select.value)
+        status.update(f"Loading {year} {event_name} {session_type} results...")
+
+        try:
+            rows = await asyncio.to_thread(load_results, year, event_name, session_type)
+        except Exception as exc:
+            status.update(f"Could not load results: {exc}")
+            return
+
+        self.current_year = year
+        self.current_event_name = event_name
+        self.current_session_type = session_type
+        self.show_results(rows)
+        status.update(f"Loaded {len(rows)} result rows.")
+
+    def show_results(self, rows: list[dict[str, object]]) -> None:
+        self.result_rows = rows
+        self.compare_indexes = []
+        details = self.query_one("#driver_details", Static)
+        details.display = False
+        details.update("")
+        self.query_one("#comparison", Vertical).display = False
+
+        table = self.query_one("#results", DataTable)
+        table.clear(columns=True)
+        column_keys = table.add_columns("Cmp", "Pos", "No", "Driver", "Team", "Status", "Time")
+        self.compare_column_key = column_keys[0]
+
+        self.result_row_keys = [
+            table.add_row(
+                "",
+                format_position_cell(row["position"]),
+                str(row["number"]),
+                str(row["driver"]),
+                Text(str(row["team"]), style=str(row["team_color"])),
+                str(row["status"]),
+                str(row["time"]),
+                key=str(row["driver_number"]),
+            )
+            for row in rows
+        ]
+
+    def refresh_compare_markers(self) -> None:
+        table = self.query_one("#results", DataTable)
+        if self.compare_column_key is None:
+            return
+
+        colors = self.compare_colors_for_indexes()
+        for index, row_key in enumerate(self.result_row_keys):
+            marker = ""
+            if index in self.compare_indexes:
+                slot = self.compare_indexes.index(index)
+                marker = Text(COMPARE_SLOTS[slot], style=f"bold {colors[slot]}")
+            table.update_cell(row_key, self.compare_column_key, marker)
+
+    def compare_colors_for_indexes(self) -> tuple[str, str]:
+        if len(self.compare_indexes) < 2:
+            return tuple(
+                str(self.result_rows[index]["team_color"]) for index in self.compare_indexes
+            ) + COMPARE_FALLBACK_COLORS[len(self.compare_indexes) :]
+        first, second = self.compare_indexes
+        return resolve_comparison_colors(
+            str(self.result_rows[first]["team_color"]),
+            str(self.result_rows[second]["team_color"]),
+        )
+
+    def action_clear_compare(self) -> None:
+        self.compare_indexes = []
+        self.refresh_compare_markers()
+        self.query_one("#comparison", Vertical).display = False
+        self.query_one("#status", Static).update("Comparison cleared.")
+
+    def action_toggle_compare(self) -> None:
+        table = self.query_one("#results", DataTable)
+        status = self.query_one("#status", Static)
+        index = table.cursor_row
+        if not self.result_rows or index is None or index >= len(self.result_rows):
+            return
+
+        if index in self.compare_indexes:
+            self.compare_indexes.remove(index)
+        elif len(self.compare_indexes) >= len(COMPARE_SLOTS):
+            self.compare_indexes = [index]
+        else:
+            self.compare_indexes.append(index)
+
+        self.refresh_compare_markers()
+
+        if len(self.compare_indexes) < len(COMPARE_SLOTS):
+            self.query_one("#comparison", Vertical).display = False
+            names = [str(self.result_rows[i]["driver"]) for i in self.compare_indexes]
+            if names:
+                status.update(f"Marked {names[0]} as A. Press c on another driver to compare.")
+            else:
+                status.update("Press c on a driver row to mark it for comparison.")
+            return
+
+        self.run_worker(self.load_comparison(), exclusive=True)
+
+    async def load_comparison(self) -> None:
+        status = self.query_one("#status", Static)
+        comparison = self.query_one("#comparison", Vertical)
+        graph = self.query_one("#compare_graph", Static)
+        metrics_table = self.query_one("#compare_metrics", DataTable)
+
+        rows = [self.result_rows[index] for index in self.compare_indexes]
+        names = [str(row["driver"]) for row in rows]
+        self.query_one("#driver_details", Static).display = False
+        comparison.display = True
+        graph.update(f"Loading comparison for {names[0]} vs {names[1]}...")
+        metrics_table.clear(columns=True)
+        status.update(f"Loading comparison for {names[0]} vs {names[1]}...")
+
+        try:
+            details = await asyncio.to_thread(
+                load_comparison_details,
+                self.current_year,
+                self.current_event_name,
+                self.current_session_type,
+                [str(row["driver_number"]) for row in rows],
+            )
+        except Exception as exc:
+            graph.update(f"Could not load comparison: {exc}")
+            status.update(f"Could not load comparison: {exc}")
+            return
+
+        colors = self.compare_colors_for_indexes()
+        graph.update(
+            make_comparison_lap_time_graph(
+                [
+                    {
+                        "label": str(row["abbreviation"]),
+                        "lap_times": detail["lap_times"],
+                        "color": color,
+                    }
+                    for row, detail, color in zip(rows, details, colors)
+                ]
+            )
+        )
+
+        metrics_table.clear(columns=True)
+        metrics_table.add_column("Metric", width=14)
+        for row, color in zip(rows, colors):
+            metrics_table.add_column(Text(str(row["abbreviation"]), style=f"bold {color}"), width=12)
+        metrics_table.add_column("Δ A-B", width=10)
+        for metric in build_comparison_metrics(
+            details[0], details[1], self.current_session_type
+        ):
+            metrics_table.add_row(*metric)
+
+        status.update(f"Comparing {names[0]} vs {names[1]}.")
+
+    async def on_data_table_row_selected(self, event: DataTable.RowSelected) -> None:
+        if event.data_table.id != "results" or event.cursor_row >= len(self.result_rows):
+            return
+
+        row = self.result_rows[event.cursor_row]
+        details = self.query_one("#driver_details", Static)
+        status = self.query_one("#status", Static)
+        driver = str(row["driver"])
+        driver_number = str(row["driver_number"])
+        self.query_one("#comparison", Vertical).display = False
+        details.display = True
+        details.update(f"Loading lap details for {driver}...")
+        status.update(f"Loading lap details for {driver}...")
+
+        try:
+            driver_details = await asyncio.to_thread(
+                load_driver_details,
+                self.current_year,
+                self.current_event_name,
+                self.current_session_type,
+                driver_number,
+            )
+        except Exception as exc:
+            details.update(f"Could not load driver details: {exc}")
+            status.update(f"Could not load driver details: {exc}")
+            return
+
+        details.update(render_driver_details(row, driver_details))
+        status.update(f"Loaded lap details for {driver}.")
+
+
+def load_event_names(year: int) -> list[str]:
+    schedule = fastf1.get_event_schedule(year)
+    schedule = schedule[schedule["RoundNumber"] > 0]
+    return [str(name) for name in schedule["EventName"].tolist()]
+
+
+TEAM_COLOR_FALLBACKS = {
+    "Alpine": "#0090ff",
+    "Aston Martin": "#006f62",
+    "Ferrari": "#dc0000",
+    "Haas F1 Team": "#b6babd",
+    "Kick Sauber": "#52e252",
+    "McLaren": "#ff8700",
+    "Mercedes": "#00d2be",
+    "RB": "#6692ff",
+    "Racing Bulls": "#6692ff",
+    "Red Bull Racing": "#0600ef",
+    "Williams": "#005aff",
+}
+
+
+def format_result_time(value: object) -> str:
+    if value is None:
+        return ""
+    try:
+        if value != value:
+            return ""
+    except Exception:
+        pass
+
+    text = str(value)
+    if text in {"NaT", "nan", "None"}:
+        return ""
+    if " days " in text:
+        return text.split(" days ", 1)[1]
+    return text
+
+
+def format_qualifying_time(result: object) -> str:
+    for column in QUALIFYING_TIME_COLUMNS:
+        time = format_result_time(result.get(column, ""))
+        if time and time not in {"NaT", "nan", "None"}:
+            return time
+    return ""
+
+
+def get_result_team_color(team_name: str, session: fastf1.core.Session) -> str:
+    try:
+        return get_team_color(team_name, session=session)
+    except Exception:
+        return TEAM_COLOR_FALLBACKS.get(team_name, "white")
+
+
+def to_position(value: object) -> object:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return ""
+
+
+def format_position_cell(position: object) -> Text:
+    try:
+        numeric_position = int(position)
+    except (TypeError, ValueError):
+        return Text(str(position))
+
+    medal = POSITION_MEDALS.get(numeric_position)
+    if medal is None:
+        return Text(str(numeric_position))
+
+    emoji, style = medal
+    return Text(f"{emoji} {numeric_position}", style=style)
+
+
+def format_compounds(compounds: list[str]) -> Text:
+    if not compounds:
+        return Text("None")
+
+    text = Text()
+    for index, compound in enumerate(compounds):
+        if index:
+            text.append(", ")
+        normalized = compound.upper()
+        text.append("🛞 ")
+        text.append(compound, style=COMPOUND_STYLES.get(normalized, ""))
+    return text
+
+
+def time_to_seconds(value: object) -> float | None:
+    if value is None:
+        return None
+    try:
+        if value != value:
+            return None
+    except Exception:
+        pass
+    if not hasattr(value, "total_seconds"):
+        return None
+    return float(value.total_seconds())
+
+
+def format_delta(seconds: float | None) -> str:
+    if seconds is None:
+        return "N/A"
+    if abs(seconds) < 0.0005:
+        return "+0.000"
+    return f"{seconds:+.3f}"
+
+
+def format_lap_time(seconds: float) -> str:
+    minutes = int(seconds // 60)
+    remaining = seconds - minutes * 60
+    return f"{minutes}:{remaining:06.3f}"
+
+
+def format_practice_lap_time(value: object) -> str:
+    if hasattr(value, "total_seconds"):
+        return format_lap_time(float(value.total_seconds()))
+    return format_result_time(value)
+
+
+def make_y_ticks(minimum: float, maximum: float, target_count: int = 10) -> list[float]:
+    span = maximum - minimum
+    if span <= 0:
+        minimum -= 0.1
+        span = 0.2
+
+    raw_step = span / target_count
+    magnitude = 10 ** math.floor(math.log10(raw_step))
+    for multiplier in (1, 2, 5, 10):
+        step = multiplier * magnitude
+        if raw_step <= step:
+            break
+
+    decimals = max(0, -math.floor(math.log10(step)))
+    start = math.floor(minimum / step) * step
+    count = math.ceil((maximum - start) / step) + 1
+    return [round(start + index * step, decimals) for index in range(count)]
+
+
+def make_lap_time_graph(lap_times: list[float]) -> str:
+    if not lap_times:
+        return "No lap times available."
+
+    plt.clear_figure()
+    y_ticks = make_y_ticks(min(lap_times), max(lap_times))
+
+    plt.plotsize(58, max(14, min(26, len(y_ticks) * 2)))
+    plt.theme("clear")
+    plt.title("Lap times")
+    plt.xlabel("Lap")
+    plt.ylabel("Seconds")
+    plt.ylim(y_ticks[0], y_ticks[-1])
+    plt.yticks(y_ticks)
+    lap_numbers = list(range(1, len(lap_times) + 1))
+    tick_step = max(1, len(lap_numbers) // 4)
+    ticks = list(range(1, len(lap_numbers) + 1, tick_step))
+    if ticks[-1] != len(lap_numbers):
+        ticks.append(len(lap_numbers))
+    plt.xticks(ticks)
+    plt.scatter(lap_numbers, lap_times, marker="dot")
+    graph = plt.uncolorize(plt.build())
+    plt.clear_figure()
+    return graph
+
+
+def render_driver_details(row: dict[str, object], details: dict[str, object]) -> Text:
+    compounds = details["compounds"]
+    lap_times = details["lap_times"]
+    fastest = format_lap_time(min(lap_times)) if lap_times else "N/A"
+    slowest = format_lap_time(max(lap_times)) if lap_times else "N/A"
+
+    text = Text()
+    text.append(str(row["driver"]) + " #" + str(row["driver_number"]) + " - " + str(row["team"]) + "\n")
+    qualifying = details.get("qualifying")
+    if qualifying:
+        text.append("Qualifying best lap: " + str(qualifying["lap_time"]))
+        text.append(" (delta to pole " + str(qualifying["delta_to_pole"]) + ")\n")
+        text.append("Sectors vs pole:\n")
+        for sector in qualifying["sectors"]:
+            text.append("  " + str(sector["name"]) + ": " + str(sector["time"]))
+            text.append(" (" + str(sector["delta_to_pole"]) + ")\n")
+        text.append("\n")
+
+    text.append("Stops: " + str(details["stops"]) + " | Tire compounds used: " + str(len(compounds)) + " (")
+    text.append_text(format_compounds(compounds))
+    text.append(")\n")
+    text.append("Lap time graph:\n" + make_lap_time_graph(lap_times) + "\n")
+    text.append("Laps: " + str(details["lap_count"]) + " | Fastest: " + fastest + " | Slowest: " + slowest)
+    return text
+
+
+def format_optional_lap_time(seconds: float | None) -> str:
+    if seconds is None:
+        return "N/A"
+    return format_lap_time(seconds)
+
+
+def to_plot_color(color: str) -> object:
+    text = str(color).strip()
+    if text.startswith("#") and len(text) == 7:
+        return tuple(int(text[index : index + 2], 16) for index in (1, 3, 5))
+    return text
+
+
+def resolve_comparison_colors(first: str, second: str) -> tuple[str, str]:
+    if str(first).strip().lower() == str(second).strip().lower():
+        return COMPARE_FALLBACK_COLORS
+    return str(first), str(second)
+
+
+def make_comparison_lap_time_graph(series: list[dict[str, object]]) -> Text:
+    plotted = [entry for entry in series if entry["lap_times"]]
+    if not plotted:
+        return Text("No lap times available.")
+
+    all_times = [lap_time for entry in plotted for lap_time in entry["lap_times"]]
+    longest = max(len(entry["lap_times"]) for entry in plotted)
+
+    plt.clear_figure()
+    y_ticks = make_y_ticks(min(all_times), max(all_times))
+    plt.plotsize(58, max(14, min(26, len(y_ticks) * 2)))
+    plt.theme("clear")
+    plt.title("Lap times")
+    plt.xlabel("Lap")
+    plt.ylabel("Seconds")
+    plt.ylim(y_ticks[0], y_ticks[-1])
+    plt.yticks(y_ticks)
+
+    tick_step = max(1, longest // 4)
+    ticks = list(range(1, longest + 1, tick_step))
+    if ticks[-1] != longest:
+        ticks.append(longest)
+    plt.xticks(ticks)
+
+    for entry in plotted:
+        lap_times = entry["lap_times"]
+        plt.scatter(
+            list(range(1, len(lap_times) + 1)),
+            lap_times,
+            marker="dot",
+            color=to_plot_color(str(entry["color"])),
+            label=str(entry["label"]),
+        )
+
+    graph = plt.build()
+    plt.clear_figure()
+    return Text.from_ansi(graph)
+
+
+def average_lap_time(lap_times: list[float]) -> float | None:
+    if not lap_times:
+        return None
+    return sum(lap_times) / len(lap_times)
+
+
+def compare_time_metric(
+    name: str, first: float | None, second: float | None
+) -> tuple[str, str, str, str]:
+    delta = None
+    if first is not None and second is not None:
+        delta = first - second
+    return (
+        name,
+        format_optional_lap_time(first),
+        format_optional_lap_time(second),
+        format_delta(delta),
+    )
+
+
+def build_comparison_metrics(
+    first: dict[str, object], second: dict[str, object], session_type: str
+) -> list[tuple[str, str, str, str]]:
+    first_times = list(first["lap_times"])
+    second_times = list(second["lap_times"])
+
+    metrics = [
+        (
+            "Laps",
+            str(first["lap_count"]),
+            str(second["lap_count"]),
+            f"{int(first['lap_count']) - int(second['lap_count']):+d}",
+        ),
+        compare_time_metric(
+            "Fastest",
+            min(first_times) if first_times else None,
+            min(second_times) if second_times else None,
+        ),
+        compare_time_metric(
+            "Slowest",
+            max(first_times) if first_times else None,
+            max(second_times) if second_times else None,
+        ),
+        compare_time_metric(
+            "Average", average_lap_time(first_times), average_lap_time(second_times)
+        ),
+        (
+            "Stops",
+            str(first["stops"]),
+            str(second["stops"]),
+            f"{int(first['stops']) - int(second['stops']):+d}",
+        ),
+        (
+            "Compounds",
+            ", ".join(first["compounds"]) or "None",
+            ", ".join(second["compounds"]) or "None",
+            "",
+        ),
+    ]
+
+    first_qualifying = first.get("qualifying")
+    second_qualifying = second.get("qualifying")
+    if session_type == QUALIFYING_SESSION_TYPE and first_qualifying and second_qualifying:
+        metrics.append(
+            (
+                "Delta to pole",
+                str(first_qualifying["delta_to_pole"]),
+                str(second_qualifying["delta_to_pole"]),
+                "",
+            )
+        )
+        for first_sector, second_sector in zip(
+            first_qualifying["sectors"], second_qualifying["sectors"]
+        ):
+            metrics.append(
+                compare_time_metric(
+                    str(first_sector["name"]),
+                    first_sector.get("seconds"),
+                    second_sector.get("seconds"),
+                )
+            )
+    return metrics
+
+
+def build_qualifying_details(laps: object, driver_laps: object) -> dict[str, object] | None:
+    timed_laps = laps.dropna(subset=["LapTime"])
+    driver_timed_laps = driver_laps.dropna(subset=["LapTime"])
+    if timed_laps.empty or driver_timed_laps.empty:
+        return None
+
+    pole_lap = timed_laps.loc[timed_laps["LapTime"].idxmin()]
+    driver_best_lap = driver_timed_laps.loc[driver_timed_laps["LapTime"].idxmin()]
+    pole_lap_time = time_to_seconds(pole_lap.get("LapTime"))
+    driver_lap_time = time_to_seconds(driver_best_lap.get("LapTime"))
+    if pole_lap_time is None or driver_lap_time is None:
+        return None
+
+    sectors: list[dict[str, str]] = []
+    for name, column in (
+        ("S1", "Sector1Time"),
+        ("S2", "Sector2Time"),
+        ("S3", "Sector3Time"),
+    ):
+        driver_sector = time_to_seconds(driver_best_lap.get(column))
+        pole_sector = time_to_seconds(pole_lap.get(column))
+        sector_delta = None
+        if driver_sector is not None and pole_sector is not None:
+            sector_delta = driver_sector - pole_sector
+        sectors.append(
+            {
+                "name": name,
+                "seconds": driver_sector,
+                "time": format_optional_lap_time(driver_sector),
+                "delta_to_pole": format_delta(sector_delta),
+            }
+        )
+
+    return {
+        "lap_time_seconds": driver_lap_time,
+        "lap_time": format_lap_time(driver_lap_time),
+        "delta_to_pole": format_delta(driver_lap_time - pole_lap_time),
+        "sectors": sectors,
+    }
+
+
+def extract_driver_details(
+    session: fastf1.core.Session, session_type: str, driver_number: str
+) -> dict[str, object]:
+    laps = session.laps[session.laps["DriverNumber"].astype(str) == driver_number]
+
+    lap_times: list[float] = []
+    for lap_time in laps["LapTime"].dropna().tolist():
+        lap_times.append(float(lap_time.total_seconds()))
+
+    compounds = [str(compound) for compound in laps["Compound"].dropna().unique().tolist()]
+    stops = int(laps["PitInTime"].notna().sum()) if "PitInTime" in laps else 0
+
+    details: dict[str, object] = {
+        "lap_count": int(len(laps)),
+        "lap_times": lap_times,
+        "stops": stops,
+        "compounds": compounds,
+    }
+    if session_type == QUALIFYING_SESSION_TYPE:
+        qualifying = build_qualifying_details(session.laps, laps)
+        if qualifying is not None:
+            details["qualifying"] = qualifying
+    return details
+
+
+def load_driver_details(
+    year: int, event_name: str, session_type: str, driver_number: str
+) -> dict[str, object]:
+    session = fastf1.get_session(year, event_name, session_type)
+    session.load(telemetry=False, weather=False, messages=False)
+    return extract_driver_details(session, session_type, driver_number)
+
+
+def load_comparison_details(
+    year: int, event_name: str, session_type: str, driver_numbers: list[str]
+) -> list[dict[str, object]]:
+    session = fastf1.get_session(year, event_name, session_type)
+    session.load(telemetry=False, weather=False, messages=False)
+    return [
+        extract_driver_details(session, session_type, driver_number)
+        for driver_number in driver_numbers
+    ]
+
+
+def load_results(year: int, event_name: str, session_type: str) -> list[dict[str, object]]:
+    session = fastf1.get_session(year, event_name, session_type)
+    session.load(telemetry=False, weather=False, messages=False)
+
+    if session_type in PRACTICE_SESSION_TYPES:
+        return load_practice_results(session)
+
+    results = session.results.fillna("")
+
+    rows: list[dict[str, object]] = []
+    for _, result in results.iterrows():
+        team_name = str(result.get("TeamName", ""))
+        rows.append(
+            {
+                "position": to_position(result.get("Position", "")),
+                "number": result.get("DriverNumber", ""),
+                "driver_number": str(result.get("DriverNumber", "")),
+                "driver": result.get("FullName", ""),
+                "abbreviation": str(result.get("Abbreviation", "") or result.get("DriverNumber", "")),
+                "team": team_name,
+                "team_color": get_result_team_color(team_name, session),
+                "status": result.get("Status", ""),
+                "time": format_qualifying_time(result)
+                if session_type == QUALIFYING_SESSION_TYPE
+                else format_result_time(result.get("Time", "")),
+            }
+        )
+    return rows
+
+
+def load_practice_results(session: fastf1.core.Session) -> list[dict[str, object]]:
+    results = session.results.fillna("")
+    driver_info_by_number = {
+        str(result.get("DriverNumber", "")): result
+        for _, result in results.iterrows()
+    }
+    timed_laps = session.laps.dropna(subset=["LapTime"])
+    best_laps = timed_laps.loc[timed_laps.groupby("DriverNumber")["LapTime"].idxmin()]
+    best_laps = best_laps.sort_values("LapTime")
+
+    rows: list[dict[str, object]] = []
+    for position, (_, lap) in enumerate(best_laps.iterrows(), start=1):
+        driver_number = str(lap.get("DriverNumber", ""))
+        driver_info = driver_info_by_number.get(driver_number)
+        team_name = str(lap.get("Team", ""))
+        driver_name = str(lap.get("Driver", ""))
+        abbreviation = str(lap.get("Driver", "") or driver_number)
+        if driver_info is not None:
+            team_name = str(driver_info.get("TeamName", team_name))
+            driver_name = str(driver_info.get("FullName", driver_name))
+            abbreviation = str(driver_info.get("Abbreviation", abbreviation) or abbreviation)
+
+        rows.append(
+            {
+                "position": position,
+                "number": driver_number,
+                "driver_number": driver_number,
+                "driver": driver_name,
+                "abbreviation": abbreviation,
+                "team": team_name,
+                "team_color": get_result_team_color(team_name, session),
+                "status": "Best lap",
+                "time": format_practice_lap_time(lap.get("LapTime", "")),
+            }
+        )
+    return rows
+
+
+def main() -> None:
+    F1ResultsApp().run()
+
+
+if __name__ == "__main__":
+    main()
