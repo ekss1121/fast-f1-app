@@ -4,7 +4,7 @@ import pandas as pd
 
 from textual.widgets import Select
 
-from main import (
+from fast_f1_app import (
     build_comparison_metrics,
     build_qualifying_details,
     F1ResultsApp,

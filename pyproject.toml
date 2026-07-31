@@ -9,3 +9,10 @@ dependencies = [
     "plotext>=5.3.2",
     "textual>=0.89.1",
 ]
+
+[project.scripts]
+fast-f1-app = "fast_f1_app:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"

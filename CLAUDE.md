@@ -4,9 +4,14 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Commands
 
-Run the app:
+Run the app from the checkout:
 ```bash
-uv run python main.py
+uv run python fast_f1_app.py
+```
+
+Install/reinstall it as the standalone `fast-f1-app` command (`uv tool install .` copies the source, so re-run it after changes, or use `--editable`):
+```bash
+uv tool install --force .
 ```
 
 Run all tests:
@@ -25,13 +30,13 @@ Package management is via `uv` (see `uv.lock`); add dependencies with `uv add <p
 
 ## Architecture
 
-This is a single-file Textual TUI app (`main.py`) that browses current-season F1 results via the `fastf1` library. There is no package layout — everything lives in `main.py`, and `tests/test_main.py` imports directly from it.
+This is a single-module Textual TUI app (`fast_f1_app.py`) that browses current-season F1 results via the `fastf1` library. There is no package directory — everything lives in that one module, and `tests/test_main.py` imports directly from it. The module name must stay in sync with the project name in `pyproject.toml`: hatchling auto-detects `fast_f1_app.py` from the `fast-f1-app` project name, and `[project.scripts]` points the console command at `fast_f1_app:main`.
 
 The code splits into two halves:
 
 1. **`F1ResultsApp` (Textual `App` subclass)** — UI state and event wiring. On mount it loads the current year's event list in a worker (`load_current_year_events`), populating the `#event` `Select`. Loading results (`on_button_pressed`) and loading a driver's lap details (`on_data_table_row_selected`) both run the blocking FastF1 calls via `asyncio.to_thread`, since `fastf1` is synchronous. All widget updates happen back on the app after the thread call returns.
 
-2. **Free functions (data/formatting layer)** — pure-ish functions that call FastF1 (`load_event_names`, `load_results`, `load_practice_results`, `load_driver_details`, `build_qualifying_details`) and functions that format data into `rich.text.Text` for display (`format_position_cell`, `format_compounds`, `render_driver_details`, `format_lap_time`, `format_delta`, etc.). These are kept separate from the App class specifically so they're unit-testable without spinning up the TUI — most of `tests/test_main.py` exercises this layer directly.
+2. **Free functions (data/formatting layer)** — pure-ish functions that call FastF1 (`load_event_names`, `load_results`, `load_practice_results`, `load_driver_details`, `build_qualifying_details`) and functions that format data into `rich.text.Text` for display (`format_position_cell`, `format_compounds`, `render_driver_details`, `format_lap_time`, `format_delta`, etc.). These are kept separate from the App class specifically so they're unit-testable without spinning up the TUI — most of `tests/test_main.py` exercises this layer directly. Note the tests do not render widgets, so UI-visible regressions pass them; verify UI changes by driving the app with Textual's `run_test()` pilot.
 
 The comparison feature (`c` marks up to two rows, `x` clears) lives in `action_toggle_compare` / `load_comparison`. `self.compare_indexes` holds indexes into `self.result_rows`; slot markers are written back into the results table's `Cmp` column via `update_cell`, so `show_results` also records `self.result_row_keys` and `self.compare_column_key`. The right-hand side of `#results_area` holds two mutually exclusive panels — `#driver_details` (single driver) and `#comparison` (graph + metrics `DataTable`) — and each view hides the other.
 
