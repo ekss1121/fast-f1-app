@@ -48,3 +48,17 @@ Key data-flow points:
 - Logging: FastF1's loggers (`fastf1`, `req`, `core`, `api`) are redirected into the in-app `RichLog` widget (`#logs`) via `TextualLogHandler`, and restored to their original handlers on unmount.
 
 Tests do not mock FastF1 network calls — they test the formatting/decoration functions and pure logic (`build_qualifying_details`, `is_valid_event_name`) directly with constructed inputs (including real `pandas` DataFrames for lap data).
+
+## Agent skills
+
+### Issue tracker
+
+Issues and PRDs live in this repo's GitHub Issues, operated via the `gh` CLI. See `docs/agents/issue-tracker.md`.
+
+### Triage labels
+
+The five canonical triage roles, each mapped to an identically-named label. See `docs/agents/triage-labels.md`.
+
+### Domain docs
+
+Single-context: `CONTEXT.md` and `docs/adr/` at the repo root. See `docs/agents/domain.md`.
