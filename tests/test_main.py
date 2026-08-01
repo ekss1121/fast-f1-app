@@ -8,12 +8,14 @@ from fast_f1_app import (
     build_comparison_metrics,
     build_qualifying_details,
     build_weekend_plan,
+    extract_driver_details,
     F1ResultsApp,
     format_compounds,
     format_lap_time,
     format_position_cell,
     format_qualifying_time,
     format_result_time,
+    has_official_classification,
     make_comparison_lap_time_graph,
     make_lap_time_graph,
     make_y_ticks,
@@ -177,7 +179,7 @@ class ComparisonTests(unittest.TestCase):
         self.assertEqual(metrics["Stops"], ("1", "2", "-1"))
         self.assertEqual(metrics["Compounds"], ("MEDIUM, HARD", "SOFT", ""))
 
-    def test_qualifying_comparison_adds_sector_deltas(self):
+    def give_both_drivers_qualifying_details(self):
         qualifying = {
             "lap_time_seconds": 80.5,
             "lap_time": "1:20.500",
@@ -190,7 +192,18 @@ class ComparisonTests(unittest.TestCase):
             {"name": "S1", "seconds": 20.4, "time": "0:20.400"}
         ]
 
+    def test_qualifying_comparison_adds_sector_deltas(self):
+        self.give_both_drivers_qualifying_details()
+
         metrics = self.metrics_by_name("Q")
+
+        self.assertEqual(metrics["Delta to pole"], ("+0.500", "+0.900", ""))
+        self.assertEqual(metrics["S1"], ("0:20.100", "0:20.400", "-0.300"))
+
+    def test_sprint_qualifying_comparison_adds_sector_deltas_too(self):
+        self.give_both_drivers_qualifying_details()
+
+        metrics = self.metrics_by_name("SQ")
 
         self.assertEqual(metrics["Delta to pole"], ("+0.500", "+0.900", ""))
         self.assertEqual(metrics["S1"], ("0:20.100", "0:20.400", "-0.300"))
@@ -239,6 +252,72 @@ class PositionTests(unittest.TestCase):
 
     def test_blank_position_renders_as_an_empty_cell(self):
         self.assertEqual(format_position_cell(to_position("")).plain, "")
+
+
+def make_results(positions):
+    """Build a results table shaped like the timing provider's, with given positions."""
+    return pd.DataFrame(
+        {
+            "DriverNumber": [str(index + 1) for index in range(len(positions))],
+            "FullName": [f"Driver {index + 1}" for index in range(len(positions))],
+            "Position": positions,
+            "Q1": [pd.NaT] * len(positions),
+            "Q2": [pd.NaT] * len(positions),
+            "Q3": [pd.NaT] * len(positions),
+        }
+    )
+
+
+class LoadedSession:
+    """Stand-in for a loaded session, carrying only the lap data under test."""
+
+    def __init__(self, laps):
+        self.laps = laps
+
+
+class ClassificationTests(unittest.TestCase):
+    def test_populated_position_column_is_official_classification(self):
+        self.assertTrue(has_official_classification(make_results([1.0, 2.0, 3.0])))
+
+    def test_wholly_empty_position_column_is_not_official_classification(self):
+        # What sprint qualifying and practice return: a full field, no positions.
+        self.assertFalse(has_official_classification(make_results([float("nan")] * 22)))
+
+    def test_partly_classified_session_keeps_its_official_positions(self):
+        self.assertTrue(has_official_classification(make_results([1.0, float("nan")])))
+
+    def test_results_without_a_position_column_are_not_classified(self):
+        self.assertFalse(has_official_classification(pd.DataFrame({"DriverNumber": ["1"]})))
+
+    def test_an_empty_results_table_is_not_classified(self):
+        self.assertFalse(has_official_classification(make_results([])))
+
+
+class SprintQualifyingTests(unittest.TestCase):
+    def setUp(self):
+        self.laps = pd.DataFrame(
+            {
+                "DriverNumber": ["1", "44"],
+                "Driver": ["VER", "HAM"],
+                "LapTime": pd.to_timedelta([80.0, 80.5], unit="s"),
+                "Sector1Time": pd.to_timedelta([20.0, 20.1], unit="s"),
+                "Sector2Time": pd.to_timedelta([30.0, 30.2], unit="s"),
+                "Sector3Time": pd.to_timedelta([30.0, 30.2], unit="s"),
+                "Compound": ["SOFT", "SOFT"],
+            }
+        )
+
+    def test_sprint_qualifying_gets_the_sector_breakdown(self):
+        details = extract_driver_details(LoadedSession(self.laps), "SQ", "44")
+
+        qualifying = details["qualifying"]
+        self.assertEqual(qualifying["delta_to_pole"], "+0.500")
+        self.assertEqual([sector["name"] for sector in qualifying["sectors"]], ["S1", "S2", "S3"])
+
+    def test_the_sprint_race_does_not_get_the_sector_breakdown(self):
+        details = extract_driver_details(LoadedSession(self.laps), "S", "44")
+
+        self.assertNotIn("qualifying", details)
 
 
 def make_event(round_number, name, year, first_day, sessions):

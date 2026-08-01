@@ -27,7 +27,6 @@ from textual.widgets import (
 )
 
 
-PRACTICE_SESSION_TYPES = {"FP1", "FP2", "FP3"}
 SESSION_SLOT_COUNT = 5
 SESSION_CODES = {
     "Practice 1": "FP1",
@@ -40,6 +39,9 @@ SESSION_CODES = {
     "Race": "R",
 }
 QUALIFYING_SESSION_TYPE = "Q"
+SPRINT_QUALIFYING_SESSION_TYPE = "SQ"
+# Both are qualifying in nature, so both get the sector-versus-fastest breakdown.
+QUALIFYING_SESSION_TYPES = {QUALIFYING_SESSION_TYPE, SPRINT_QUALIFYING_SESSION_TYPE}
 QUALIFYING_TIME_COLUMNS = ("Q3", "Q2", "Q1")
 POSITION_MEDALS = {
     1: ("🥇", "gold1"),
@@ -970,7 +972,7 @@ def build_comparison_metrics(
 
     first_qualifying = first.get("qualifying")
     second_qualifying = second.get("qualifying")
-    if session_type == QUALIFYING_SESSION_TYPE and first_qualifying and second_qualifying:
+    if session_type in QUALIFYING_SESSION_TYPES and first_qualifying and second_qualifying:
         metrics.append(
             (
                 "Delta to pole",
@@ -1051,7 +1053,7 @@ def extract_driver_details(
         "stops": stops,
         "compounds": compounds,
     }
-    if session_type == QUALIFYING_SESSION_TYPE:
+    if session_type in QUALIFYING_SESSION_TYPES:
         qualifying = build_qualifying_details(session.laps, laps)
         if qualifying is not None:
             details["qualifying"] = qualifying
@@ -1077,12 +1079,29 @@ def load_comparison_details(
     ]
 
 
+def has_official_classification(results: object) -> bool:
+    """Report whether a results table carries a usable official classification.
+
+    The session type does not say which ranking path applies, the data does.
+    Practice and sprint qualifying both come back with a full set of driver rows
+    whose position column is entirely empty, and so does any session that has run
+    but has not been classified yet. Anything with at least one real position is
+    treated as classified, so a partly classified session still uses its own
+    positions.
+    """
+    if results is None or len(results) == 0:
+        return False
+    if "Position" not in results:
+        return False
+    return any(to_position(value) != "" for value in results["Position"].tolist())
+
+
 def load_results(year: int, event_name: str, session_type: str) -> list[dict[str, object]]:
     session = fastf1.get_session(year, event_name, session_type)
     session.load(telemetry=False, weather=False, messages=False)
 
-    if session_type in PRACTICE_SESSION_TYPES:
-        return load_practice_results(session)
+    if not has_official_classification(session.results):
+        return load_best_lap_results(session)
 
     results = session.results.fillna("")
 
@@ -1100,14 +1119,15 @@ def load_results(year: int, event_name: str, session_type: str) -> list[dict[str
                 "team_color": get_result_team_color(team_name, session),
                 "status": result.get("Status", ""),
                 "time": format_qualifying_time(result)
-                if session_type == QUALIFYING_SESSION_TYPE
+                if session_type in QUALIFYING_SESSION_TYPES
                 else format_result_time(result.get("Time", "")),
             }
         )
     return rows
 
 
-def load_practice_results(session: fastf1.core.Session) -> list[dict[str, object]]:
+def load_best_lap_results(session: fastf1.core.Session) -> list[dict[str, object]]:
+    """Rank the field by each driver's best lap, for sessions with no classification."""
     results = session.results.fillna("")
     driver_info_by_number = {
         str(result.get("DriverNumber", "")): result
