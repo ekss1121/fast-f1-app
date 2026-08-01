@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import math
+import re
 from datetime import date
 
 import fastf1
@@ -12,17 +13,20 @@ from fastf1.plotting import get_team_color
 from rich.text import Text
 from textual.app import App, ComposeResult
 from textual.containers import Horizontal, Vertical
-from textual.widgets import Button, DataTable, Footer, Header, Label, RichLog, Select, Static
+from textual.widgets import (
+    Button,
+    DataTable,
+    Footer,
+    Header,
+    Label,
+    RichLog,
+    Select,
+    Static,
+    TabbedContent,
+    TabPane,
+)
 
 
-SESSION_TYPES = [
-    ("Race", "R"),
-    ("Sprint", "S"),
-    ("Qualifying", "Q"),
-    ("Practice 1", "FP1"),
-    ("Practice 2", "FP2"),
-    ("Practice 3", "FP3"),
-]
 PRACTICE_SESSION_TYPES = {"FP1", "FP2", "FP3"}
 SESSION_SLOT_COUNT = 5
 SESSION_CODES = {
@@ -80,6 +84,10 @@ class SessionResultsView(Horizontal):
         self.year = date.today().year
         self.event_name = ""
         self.session_type = "R"
+        self.session_name = ""
+        self.has_started = True
+        self.loaded = False
+        self.is_loading = False
 
     def compose(self) -> ComposeResult:
         yield DataTable(classes="results")
@@ -97,10 +105,14 @@ class SessionResultsView(Horizontal):
     def set_status(self, message: str) -> None:
         self.app.set_status(message)
 
-    def set_context(self, year: int, event_name: str, session_type: str) -> None:
+    def set_context(self, year: int, event_name: str, session: dict[str, object]) -> None:
         self.year = year
         self.event_name = event_name
-        self.session_type = session_type
+        self.session_type = str(session["code"])
+        self.session_name = str(session["name"])
+        self.has_started = bool(session.get("has_started", True))
+        self.loaded = False
+        self.is_loading = False
 
     def show_results(self, rows: list[dict[str, object]]) -> None:
         self.result_rows = rows
@@ -292,6 +304,10 @@ class F1ResultsApp(App):
         padding: 1;
     }
 
+    #sessions {
+        height: 1fr;
+    }
+
     SessionResultsView {
         height: 1fr;
     }
@@ -346,17 +362,20 @@ class F1ResultsApp(App):
         with Horizontal(id="controls"):
             yield Label("Event")
             yield Select([], prompt="Loading events...", allow_blank=True, id="event", disabled=True)
-            yield Select(SESSION_TYPES, value="R", id="session_type")
             yield Button("Load Results", variant="primary", id="load", disabled=True)
-        yield Static("Select an event, then load results.", id="status")
-        yield SessionResultsView()
+        yield Static("Finding the current race weekend...", id="status")
+        yield TabbedContent(id="sessions")
         yield Static("Logs", id="log_title")
         yield RichLog(id="logs", markup=True, highlight=True)
         yield Footer()
 
     @property
-    def results_view(self) -> SessionResultsView:
-        return self.query_one(SessionResultsView)
+    def active_view(self) -> SessionResultsView | None:
+        pane = self.query_one("#sessions", TabbedContent).active_pane
+        if pane is None:
+            return None
+        views = pane.query(SessionResultsView)
+        return views.first(SessionResultsView) if views else None
 
     def set_status(self, message: str) -> None:
         self.query_one("#status", Static).update(message)
@@ -364,6 +383,8 @@ class F1ResultsApp(App):
     def on_mount(self) -> None:
         self.event_names: list[str] = []
         self.season_year = date.today().year
+        self.schedule = None
+        self.tabs_ready = False
 
         self.log_handler = TextualLogHandler(self)
         self.log_handler.setFormatter(
@@ -401,7 +422,6 @@ class F1ResultsApp(App):
     async def load_startup_weekend(self) -> None:
         status = self.query_one("#status", Static)
         event_select = self.query_one("#event", Select)
-        session_select = self.query_one("#session_type", Select)
         load_button = self.query_one("#load", Button)
         status.update("Finding the current race weekend...")
 
@@ -411,6 +431,7 @@ class F1ResultsApp(App):
             status.update(f"Could not load the Grand Prix list: {exc}")
             return
 
+        self.schedule = resolved["schedule"]
         event_names = list(resolved["event_names"])
         self.event_names = event_names
         event_select.set_options([(name, name) for name in event_names])
@@ -429,30 +450,64 @@ class F1ResultsApp(App):
             status.update("Select a Grand Prix, then load results.")
             return
 
+        event_select.value = str(plan["event_name"])
+        await self.show_weekend(plan)
+
+    async def show_weekend(self, plan: dict[str, object]) -> None:
+        """Rebuild the tab strip for one weekend and load only the opening tab."""
+        status = self.query_one("#status", Static)
+        tabs = self.query_one("#sessions", TabbedContent)
+
         self.season_year = int(plan["year"])
         event_name = str(plan["event_name"])
-        session_type = str(plan["default_session"])
-        event_select.value = event_name
-        if session_type in {value for _, value in SESSION_TYPES}:
-            session_select.value = session_type
+        sessions = list(plan["sessions"])
 
-        await self.load_session(event_name, session_type)
+        self.tabs_ready = False
+        await tabs.clear_panes()
+        for session in sessions:
+            view = SessionResultsView()
+            view.set_context(self.season_year, event_name, session)
+            await tabs.add_pane(TabPane(str(session["name"]), view, id=tab_id(session["code"])))
 
-    async def load_session(self, event_name: str, session_type: str) -> None:
-        status = self.query_one("#status", Static)
-        year = self.season_year
-        status.update(f"Loading {year} {event_name} {session_type} results...")
+        tabs.active = tab_id(str(plan["default_session"]))
+        self.tabs_ready = True
+        status.update(f"{self.season_year} {event_name} - {len(sessions)} sessions.")
+        await self.ensure_active_tab_loaded()
 
-        try:
-            rows = await asyncio.to_thread(load_results, year, event_name, session_type)
-        except Exception as exc:
-            status.update(f"Could not load results: {exc}")
+    async def ensure_active_tab_loaded(self) -> None:
+        view = self.active_view
+        if view is not None:
+            await self.ensure_tab_loaded(view)
+
+    async def ensure_tab_loaded(self, view: SessionResultsView) -> None:
+        if view.loaded or view.is_loading:
             return
 
-        view = self.results_view
-        view.set_context(year, event_name, session_type)
+        status = self.query_one("#status", Static)
+        view.is_loading = True
+        view.loading = True
+        status.update(f"Loading {view.event_name} {view.session_name}...")
+
+        try:
+            rows = await asyncio.to_thread(
+                load_results, view.year, view.event_name, view.session_type
+            )
+        except Exception as exc:
+            view.is_loading = False
+            view.loading = False
+            status.update(f"Could not load {view.session_name}: {exc}")
+            return
+
+        view.loading = False
+        view.is_loading = False
+        view.loaded = True
         view.show_results(rows)
-        status.update(f"Loaded {len(rows)} result rows for {event_name} {session_type}.")
+        status.update(f"Loaded {len(rows)} result rows for {view.session_name}.")
+
+    async def on_tabbed_content_tab_activated(self, event: TabbedContent.TabActivated) -> None:
+        if not self.tabs_ready:
+            return
+        await self.ensure_active_tab_loaded()
 
     def is_valid_event_name(self, value: object) -> bool:
         return isinstance(value, str) and value in self.event_names
@@ -469,7 +524,6 @@ class F1ResultsApp(App):
             return
 
         event_select = self.query_one("#event", Select)
-        session_select = self.query_one("#session_type", Select)
         status = self.query_one("#status", Static)
 
         event_value = event_select.value
@@ -479,13 +533,22 @@ class F1ResultsApp(App):
             status.update("Select a Grand Prix before loading results.")
             return
 
-        await self.load_session(str(event_value), str(session_select.value))
+        plan = build_event_plan(self.schedule, str(event_value), utc_now())
+        if plan is None:
+            status.update(f"No sessions found for {event_value}.")
+            return
+
+        await self.show_weekend(plan)
 
     def action_toggle_compare(self) -> None:
-        self.results_view.toggle_compare()
+        view = self.active_view
+        if view is not None:
+            view.toggle_compare()
 
     def action_clear_compare(self) -> None:
-        self.results_view.clear_compare()
+        view = self.active_view
+        if view is not None:
+            view.clear_compare()
 
 
 def load_event_names(year: int) -> list[str]:
@@ -505,6 +568,11 @@ def utc_now() -> object:
 
 def session_code(name: str) -> str:
     return SESSION_CODES.get(name, name)
+
+
+def tab_id(code: str) -> str:
+    """Widget ids must be identifiers, so codes become tab-prefixed ids."""
+    return "tab_" + re.sub(r"\W", "_", code)
 
 
 def weekend_sessions(event: object) -> list[dict[str, object]]:
@@ -532,6 +600,33 @@ def weekend_sessions(event: object) -> list[dict[str, object]]:
     return sessions
 
 
+def plan_from_event(event: object, now: object) -> dict[str, object] | None:
+    """Describe one schedule row's weekend: its sessions and which to open on."""
+    sessions = weekend_sessions(event)
+    if not sessions:
+        return None
+
+    for session in sessions:
+        session["has_started"] = bool(session["start"] <= now)
+    started = [session for session in sessions if session["has_started"]]
+
+    return {
+        "year": int(event["EventDate"].year),
+        "event_name": str(event["EventName"]),
+        "sessions": sessions,
+        "default_session": str(started[-1]["code"]) if started else str(sessions[0]["code"]),
+    }
+
+
+def build_event_plan(schedule: object, event_name: str, now: object) -> dict[str, object] | None:
+    """Describe a named weekend, whether or not it has started yet."""
+    rounds = schedule[schedule["RoundNumber"] > 0]
+    matches = rounds[rounds["EventName"] == event_name]
+    if matches.empty:
+        return None
+    return plan_from_event(matches.iloc[0], now)
+
+
 def build_weekend_plan(schedule: object, now: object) -> dict[str, object] | None:
     """Describe the most recent weekend that has started, or None if none has.
 
@@ -548,22 +643,11 @@ def build_weekend_plan(schedule: object, now: object) -> dict[str, object] | Non
         if not sessions or sessions[0]["start"] > now:
             continue
         if chosen is None or sessions[0]["start"] > chosen[0]:
-            chosen = (sessions[0]["start"], event, sessions)
+            chosen = (sessions[0]["start"], event)
 
     if chosen is None:
         return None
-
-    _, event, sessions = chosen
-    for session in sessions:
-        session["has_started"] = bool(session["start"] <= now)
-    started = [session for session in sessions if session["has_started"]]
-
-    return {
-        "year": int(event["EventDate"].year),
-        "event_name": str(event["EventName"]),
-        "sessions": sessions,
-        "default_session": str(started[-1]["code"]),
-    }
+    return plan_from_event(chosen[1], now)
 
 
 def resolve_startup_weekend(now: object) -> dict[str, object]:
@@ -573,7 +657,11 @@ def resolve_startup_weekend(now: object) -> dict[str, object]:
     if plan is None:
         schedule = fastf1.get_event_schedule(now.year - 1)
         plan = build_weekend_plan(schedule, now)
-    return {"plan": plan, "event_names": event_names_of(schedule)}
+    return {
+        "plan": plan,
+        "event_names": event_names_of(schedule),
+        "schedule": schedule,
+    }
 
 
 TEAM_COLOR_FALLBACKS = {
