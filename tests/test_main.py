@@ -7,12 +7,21 @@ from textual.widgets import Select
 from fast_f1_app import (
     build_comparison_metrics,
     build_qualifying_details,
+    build_weekend_plan,
+    extract_driver_details,
     F1ResultsApp,
     format_compounds,
+    format_empty_season_message,
     format_lap_time,
+    format_not_started_message,
+    format_not_started_status,
     format_position_cell,
     format_qualifying_time,
     format_result_time,
+    format_schedule_error,
+    format_session_error,
+    format_session_start,
+    has_official_classification,
     make_comparison_lap_time_graph,
     make_lap_time_graph,
     make_y_ticks,
@@ -176,7 +185,7 @@ class ComparisonTests(unittest.TestCase):
         self.assertEqual(metrics["Stops"], ("1", "2", "-1"))
         self.assertEqual(metrics["Compounds"], ("MEDIUM, HARD", "SOFT", ""))
 
-    def test_qualifying_comparison_adds_sector_deltas(self):
+    def give_both_drivers_qualifying_details(self):
         qualifying = {
             "lap_time_seconds": 80.5,
             "lap_time": "1:20.500",
@@ -189,7 +198,18 @@ class ComparisonTests(unittest.TestCase):
             {"name": "S1", "seconds": 20.4, "time": "0:20.400"}
         ]
 
+    def test_qualifying_comparison_adds_sector_deltas(self):
+        self.give_both_drivers_qualifying_details()
+
         metrics = self.metrics_by_name("Q")
+
+        self.assertEqual(metrics["Delta to pole"], ("+0.500", "+0.900", ""))
+        self.assertEqual(metrics["S1"], ("0:20.100", "0:20.400", "-0.300"))
+
+    def test_sprint_qualifying_comparison_adds_sector_deltas_too(self):
+        self.give_both_drivers_qualifying_details()
+
+        metrics = self.metrics_by_name("SQ")
 
         self.assertEqual(metrics["Delta to pole"], ("+0.500", "+0.900", ""))
         self.assertEqual(metrics["S1"], ("0:20.100", "0:20.400", "-0.300"))
@@ -238,6 +258,236 @@ class PositionTests(unittest.TestCase):
 
     def test_blank_position_renders_as_an_empty_cell(self):
         self.assertEqual(format_position_cell(to_position("")).plain, "")
+
+
+def make_results(positions):
+    """Build a results table shaped like the timing provider's, with given positions."""
+    return pd.DataFrame(
+        {
+            "DriverNumber": [str(index + 1) for index in range(len(positions))],
+            "FullName": [f"Driver {index + 1}" for index in range(len(positions))],
+            "Position": positions,
+            "Q1": [pd.NaT] * len(positions),
+            "Q2": [pd.NaT] * len(positions),
+            "Q3": [pd.NaT] * len(positions),
+        }
+    )
+
+
+class LoadedSession:
+    """Stand-in for a loaded session, carrying only the lap data under test."""
+
+    def __init__(self, laps):
+        self.laps = laps
+
+
+class ClassificationTests(unittest.TestCase):
+    def test_populated_position_column_is_official_classification(self):
+        self.assertTrue(has_official_classification(make_results([1.0, 2.0, 3.0])))
+
+    def test_wholly_empty_position_column_is_not_official_classification(self):
+        # What sprint qualifying and practice return: a full field, no positions.
+        self.assertFalse(has_official_classification(make_results([float("nan")] * 22)))
+
+    def test_partly_classified_session_keeps_its_official_positions(self):
+        self.assertTrue(has_official_classification(make_results([1.0, float("nan")])))
+
+    def test_results_without_a_position_column_are_not_classified(self):
+        self.assertFalse(has_official_classification(pd.DataFrame({"DriverNumber": ["1"]})))
+
+    def test_an_empty_results_table_is_not_classified(self):
+        self.assertFalse(has_official_classification(make_results([])))
+
+
+class SprintQualifyingTests(unittest.TestCase):
+    def setUp(self):
+        self.laps = pd.DataFrame(
+            {
+                "DriverNumber": ["1", "44"],
+                "Driver": ["VER", "HAM"],
+                "LapTime": pd.to_timedelta([80.0, 80.5], unit="s"),
+                "Sector1Time": pd.to_timedelta([20.0, 20.1], unit="s"),
+                "Sector2Time": pd.to_timedelta([30.0, 30.2], unit="s"),
+                "Sector3Time": pd.to_timedelta([30.0, 30.2], unit="s"),
+                "Compound": ["SOFT", "SOFT"],
+            }
+        )
+
+    def test_sprint_qualifying_gets_the_sector_breakdown(self):
+        details = extract_driver_details(LoadedSession(self.laps), "SQ", "44")
+
+        qualifying = details["qualifying"]
+        self.assertEqual(qualifying["delta_to_pole"], "+0.500")
+        self.assertEqual([sector["name"] for sector in qualifying["sectors"]], ["S1", "S2", "S3"])
+
+    def test_the_sprint_race_does_not_get_the_sector_breakdown(self):
+        details = extract_driver_details(LoadedSession(self.laps), "S", "44")
+
+        self.assertNotIn("qualifying", details)
+
+
+def make_event(round_number, name, year, first_day, sessions):
+    """Build one schedule row; sessions is a list of (name, day offset, hour)."""
+    row = {
+        "RoundNumber": round_number,
+        "EventName": name,
+        "EventDate": pd.Timestamp(f"{year}-{first_day}") + pd.Timedelta(days=2),
+    }
+    for slot in range(1, 6):
+        if slot <= len(sessions):
+            session_name, day_offset, hour = sessions[slot - 1]
+            row[f"Session{slot}"] = session_name
+            row[f"Session{slot}DateUtc"] = (
+                pd.Timestamp(f"{year}-{first_day}")
+                + pd.Timedelta(days=day_offset, hours=hour)
+            )
+        else:
+            row[f"Session{slot}"] = None
+            row[f"Session{slot}DateUtc"] = pd.NaT
+    return row
+
+
+CONVENTIONAL = [
+    ("Practice 1", 0, 12),
+    ("Practice 2", 0, 16),
+    ("Practice 3", 1, 12),
+    ("Qualifying", 1, 16),
+    ("Race", 2, 14),
+]
+SPRINT = [
+    ("Practice 1", 0, 12),
+    ("Sprint Qualifying", 0, 16),
+    ("Sprint", 1, 12),
+    ("Qualifying", 1, 16),
+    ("Race", 2, 14),
+]
+
+
+def make_schedule(events):
+    return pd.DataFrame([{"RoundNumber": 0, "EventName": "Pre-Season Testing",
+                          "EventDate": pd.Timestamp("2026-02-01"),
+                          **{f"Session{s}": None for s in range(1, 6)},
+                          **{f"Session{s}DateUtc": pd.NaT for s in range(1, 6)}}] + events)
+
+
+class WeekendPlanTests(unittest.TestCase):
+    def test_conventional_weekend_lists_five_sessions_in_schedule_order(self):
+        schedule = make_schedule([make_event(1, "Australian Grand Prix", 2026, "03-06", CONVENTIONAL)])
+
+        plan = build_weekend_plan(schedule, pd.Timestamp("2026-03-10 00:00"))
+
+        self.assertEqual(plan["event_name"], "Australian Grand Prix")
+        self.assertEqual(plan["year"], 2026)
+        self.assertEqual(
+            [session["code"] for session in plan["sessions"]],
+            ["FP1", "FP2", "FP3", "Q", "R"],
+        )
+        self.assertEqual(plan["default_session"], "R")
+
+    def test_sprint_weekend_swaps_practice_for_sprint_sessions(self):
+        schedule = make_schedule([make_event(1, "Chinese Grand Prix", 2026, "03-13", SPRINT)])
+
+        plan = build_weekend_plan(schedule, pd.Timestamp("2026-03-17 00:00"))
+
+        codes = [session["code"] for session in plan["sessions"]]
+        self.assertEqual(codes, ["FP1", "SQ", "S", "Q", "R"])
+        self.assertNotIn("FP2", codes)
+        self.assertNotIn("FP3", codes)
+
+    def test_mid_weekend_marks_future_sessions_and_defaults_to_last_finished(self):
+        schedule = make_schedule([make_event(1, "Australian Grand Prix", 2026, "03-06", CONVENTIONAL)])
+
+        # Saturday evening: qualifying has run, the race has not.
+        plan = build_weekend_plan(schedule, pd.Timestamp("2026-03-07 18:00"))
+
+        started = {session["code"]: session["has_started"] for session in plan["sessions"]}
+        self.assertEqual(started, {"FP1": True, "FP2": True, "FP3": True, "Q": True, "R": False})
+        self.assertEqual(plan["default_session"], "Q")
+
+    def test_between_rounds_picks_the_most_recently_started_weekend(self):
+        schedule = make_schedule([
+            make_event(1, "Australian Grand Prix", 2026, "03-06", CONVENTIONAL),
+            make_event(2, "Chinese Grand Prix", 2026, "03-13", SPRINT),
+        ])
+
+        plan = build_weekend_plan(schedule, pd.Timestamp("2026-03-18 00:00"))
+
+        self.assertEqual(plan["event_name"], "Chinese Grand Prix")
+        self.assertEqual(plan["default_session"], "R")
+
+    def test_an_upcoming_weekend_is_not_chosen_before_it_starts(self):
+        schedule = make_schedule([
+            make_event(1, "Australian Grand Prix", 2026, "03-06", CONVENTIONAL),
+            make_event(2, "Chinese Grand Prix", 2026, "03-13", SPRINT),
+        ])
+
+        plan = build_weekend_plan(schedule, pd.Timestamp("2026-03-11 00:00"))
+
+        self.assertEqual(plan["event_name"], "Australian Grand Prix")
+
+    def test_returns_none_before_the_seasons_first_session(self):
+        schedule = make_schedule([make_event(1, "Australian Grand Prix", 2026, "03-06", CONVENTIONAL)])
+
+        self.assertIsNone(build_weekend_plan(schedule, pd.Timestamp("2026-01-15 00:00")))
+
+    def test_previous_seasons_schedule_yields_its_final_round(self):
+        # How the off-season fallback works: the same call, fed last season.
+        schedule = make_schedule([
+            make_event(1, "Australian Grand Prix", 2025, "03-14", CONVENTIONAL),
+            make_event(24, "Abu Dhabi Grand Prix", 2025, "12-05", CONVENTIONAL),
+        ])
+
+        plan = build_weekend_plan(schedule, pd.Timestamp("2026-01-15 00:00"))
+
+        self.assertEqual(plan["event_name"], "Abu Dhabi Grand Prix")
+        self.assertEqual(plan["year"], 2025)
+        self.assertEqual(plan["default_session"], "R")
+
+    def test_testing_events_are_ignored(self):
+        schedule = make_schedule([make_event(1, "Australian Grand Prix", 2026, "03-06", CONVENTIONAL)])
+
+        plan = build_weekend_plan(schedule, pd.Timestamp("2026-03-10 00:00"))
+
+        self.assertNotEqual(plan["event_name"], "Pre-Season Testing")
+
+
+class TabStateMessageTests(unittest.TestCase):
+    def test_not_started_message_names_the_session_and_its_start_time(self):
+        message = format_not_started_message("Race", pd.Timestamp("2026-08-23 13:00"))
+
+        self.assertIn("Race has not started yet", message)
+        self.assertIn("Sun 23 Aug 2026 13:00 UTC", message)
+
+    def test_not_started_status_is_a_one_line_version_of_the_same_thing(self):
+        status = format_not_started_status("Qualifying", pd.Timestamp("2026-08-22 14:00"))
+
+        self.assertNotIn("\n", status)
+        self.assertIn("Qualifying", status)
+        self.assertIn("Sat 22 Aug 2026 14:00 UTC", status)
+
+    def test_a_session_without_a_published_start_time_still_reads_sensibly(self):
+        for start in (None, pd.NaT):
+            with self.subTest(start=start):
+                self.assertEqual(format_session_start(start), "an unannounced time")
+                self.assertIn("an unannounced time", format_not_started_message("Sprint", start))
+
+    def test_session_error_reports_the_failure_and_how_to_retry(self):
+        message = format_session_error("Practice 2", ValueError("no data for this session"))
+
+        self.assertIn("Could not load Practice 2", message)
+        self.assertIn("no data for this session", message)
+        self.assertIn("unaffected", message)
+        self.assertIn("again", message)
+
+    def test_schedule_fetch_failure_reads_differently_from_an_empty_season(self):
+        failure = format_schedule_error(2026, ConnectionError("name resolution failed"))
+        empty = format_empty_season_message(2026)
+
+        self.assertIn("name resolution failed", failure)
+        self.assertNotIn("name resolution failed", empty)
+        self.assertIn("no Grand Prix events", empty)
+        self.assertNotIn("no Grand Prix events", failure)
+        self.assertNotEqual(failure, empty)
 
 
 class EventValidationTests(unittest.TestCase):
