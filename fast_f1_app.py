@@ -14,7 +14,6 @@ from rich.text import Text
 from textual.app import App, ComposeResult
 from textual.containers import Horizontal, Vertical
 from textual.widgets import (
-    Button,
     DataTable,
     Footer,
     Header,
@@ -385,6 +384,7 @@ class F1ResultsApp(App):
 
     BINDINGS = [
         ("q", "quit", "Quit"),
+        ("r", "refresh_session", "Refresh session"),
         ("c", "toggle_compare", "Mark for compare"),
         ("x", "clear_compare", "Clear compare"),
     ]
@@ -394,7 +394,6 @@ class F1ResultsApp(App):
         with Horizontal(id="controls"):
             yield Label("Event")
             yield Select([], prompt="Loading events...", allow_blank=True, id="event", disabled=True)
-            yield Button("Load Results", variant="primary", id="load", disabled=True)
         yield Static("Finding the current race weekend...", id="status")
         yield TabbedContent(id="sessions")
         yield Static("Logs", id="log_title")
@@ -417,6 +416,7 @@ class F1ResultsApp(App):
         self.season_year = date.today().year
         self.schedule = None
         self.tabs_ready = False
+        self.loaded_event_name: str | None = None
 
         self.log_handler = TextualLogHandler(self)
         self.log_handler.setFormatter(
@@ -454,7 +454,6 @@ class F1ResultsApp(App):
     async def load_startup_weekend(self) -> None:
         status = self.query_one("#status", Static)
         event_select = self.query_one("#event", Select)
-        load_button = self.query_one("#load", Button)
         status.update("Finding the current race weekend...")
 
         try:
@@ -469,19 +468,20 @@ class F1ResultsApp(App):
         event_select.set_options([(name, name) for name in event_names])
         if not event_names:
             event_select.disabled = True
-            load_button.disabled = True
             status.update(format_empty_season_message(int(resolved["year"])))
             return
 
         event_select.disabled = False
-        load_button.disabled = False
 
         plan = resolved["plan"]
         if plan is None:
+            status.update("Select a Grand Prix to load its weekend.")
             event_select.value = event_names[0]
-            status.update("Select a Grand Prix, then load results.")
             return
 
+        # Claim the event before assigning it, so the Changed message this
+        # assignment posts is recognised as our own and does not load twice.
+        self.loaded_event_name = str(plan["event_name"])
         event_select.value = str(plan["event_name"])
         await self.show_weekend(plan)
 
@@ -493,6 +493,7 @@ class F1ResultsApp(App):
         self.season_year = int(plan["year"])
         event_name = str(plan["event_name"])
         sessions = list(plan["sessions"])
+        self.loaded_event_name = event_name
 
         self.tabs_ready = False
         await tabs.clear_panes()
@@ -551,33 +552,36 @@ class F1ResultsApp(App):
     def is_valid_event_name(self, value: object) -> bool:
         return isinstance(value, str) and value in self.event_names
 
-    def on_select_changed(self, event: Select.Changed) -> None:
+    async def on_select_changed(self, event: Select.Changed) -> None:
+        """Picking another Grand Prix rebuilds the weekend, with no button press."""
         if event.select.id != "event" or not hasattr(self, "event_names"):
             return
-
-        load_button = self.query_one("#load", Button)
-        load_button.disabled = not self.is_valid_event_name(event.value)
-
-    async def on_button_pressed(self, event: Button.Pressed) -> None:
-        if event.button.id != "load":
+        if not self.is_valid_event_name(event.value):
             return
 
-        event_select = self.query_one("#event", Select)
-        status = self.query_one("#status", Static)
-
-        event_value = event_select.value
-        if not self.is_valid_event_name(event_value):
-            load_button = self.query_one("#load", Button)
-            load_button.disabled = True
-            status.update("Select a Grand Prix before loading results.")
+        event_name = str(event.value)
+        if event_name == self.loaded_event_name:
+            # Startup and set_options assign the value themselves; only a change
+            # to a weekend we are not already showing is worth rebuilding for.
             return
 
-        plan = build_event_plan(self.schedule, str(event_value), utc_now())
+        plan = build_event_plan(self.schedule, event_name, utc_now())
         if plan is None:
-            status.update(f"No sessions found for {event_value}.")
+            self.set_status(f"No sessions found for {event_name}.")
             return
 
         await self.show_weekend(plan)
+
+    def action_refresh_session(self) -> None:
+        view = self.active_view
+        if view is None or view.is_loading:
+            return
+        self.run_worker(self.refresh_tab(view))
+
+    async def refresh_tab(self, view: SessionResultsView) -> None:
+        """Discard one tab's cached rows and fetch them again, leaving others alone."""
+        view.loaded = False
+        await self.ensure_tab_loaded(view)
 
     def action_toggle_compare(self) -> None:
         view = self.active_view
