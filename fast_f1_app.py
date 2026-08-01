@@ -6,6 +6,7 @@ import math
 from datetime import date
 
 import fastf1
+import pandas as pd
 import plotext as plt
 from fastf1.plotting import get_team_color
 from rich.text import Text
@@ -23,6 +24,17 @@ SESSION_TYPES = [
     ("Practice 3", "FP3"),
 ]
 PRACTICE_SESSION_TYPES = {"FP1", "FP2", "FP3"}
+SESSION_SLOT_COUNT = 5
+SESSION_CODES = {
+    "Practice 1": "FP1",
+    "Practice 2": "FP2",
+    "Practice 3": "FP3",
+    "Qualifying": "Q",
+    "Sprint Qualifying": "SQ",
+    "Sprint Shootout": "SQ",
+    "Sprint": "S",
+    "Race": "R",
+}
 QUALIFYING_SESSION_TYPE = "Q"
 QUALIFYING_TIME_COLUMNS = ("Q3", "Q2", "Q1")
 POSITION_MEDALS = {
@@ -52,6 +64,209 @@ class TextualLogHandler(logging.Handler):
             self.app.write_log_message(message)
 
 
+class SessionResultsView(Horizontal):
+    """Results table plus the driver-detail and comparison panels for one session.
+
+    Owns every widget and every piece of state belonging to a single session, so
+    that several of these can coexist without colliding.
+    """
+
+    def __init__(self, **kwargs: object) -> None:
+        super().__init__(**kwargs)
+        self.result_rows: list[dict[str, object]] = []
+        self.compare_indexes: list[int] = []
+        self.compare_column_key = None
+        self.result_row_keys: list[object] = []
+        self.year = date.today().year
+        self.event_name = ""
+        self.session_type = "R"
+
+    def compose(self) -> ComposeResult:
+        yield DataTable(classes="results")
+        details = Static("", classes="driver-details")
+        details.display = False
+        yield details
+        with Vertical(classes="comparison"):
+            yield Static("", classes="compare-graph")
+            yield DataTable(classes="compare-metrics")
+
+    def on_mount(self) -> None:
+        self.query_one(".results", DataTable).cursor_type = "row"
+        self.query_one(".comparison", Vertical).display = False
+
+    def set_status(self, message: str) -> None:
+        self.app.set_status(message)
+
+    def set_context(self, year: int, event_name: str, session_type: str) -> None:
+        self.year = year
+        self.event_name = event_name
+        self.session_type = session_type
+
+    def show_results(self, rows: list[dict[str, object]]) -> None:
+        self.result_rows = rows
+        self.compare_indexes = []
+        details = self.query_one(".driver-details", Static)
+        details.display = False
+        details.update("")
+        self.query_one(".comparison", Vertical).display = False
+
+        table = self.query_one(".results", DataTable)
+        table.clear(columns=True)
+        column_keys = table.add_columns("Cmp", "Pos", "No", "Driver", "Team", "Status", "Time")
+        self.compare_column_key = column_keys[0]
+
+        self.result_row_keys = [
+            table.add_row(
+                "",
+                format_position_cell(row["position"]),
+                str(row["number"]),
+                str(row["driver"]),
+                Text(str(row["team"]), style=str(row["team_color"])),
+                str(row["status"]),
+                str(row["time"]),
+                key=str(row["driver_number"]),
+            )
+            for row in rows
+        ]
+
+    def refresh_compare_markers(self) -> None:
+        table = self.query_one(".results", DataTable)
+        if self.compare_column_key is None:
+            return
+
+        colors = self.compare_colors_for_indexes()
+        for index, row_key in enumerate(self.result_row_keys):
+            marker = ""
+            if index in self.compare_indexes:
+                slot = self.compare_indexes.index(index)
+                marker = Text(COMPARE_SLOTS[slot], style=f"bold {colors[slot]}")
+            table.update_cell(row_key, self.compare_column_key, marker)
+
+    def compare_colors_for_indexes(self) -> tuple[str, str]:
+        if len(self.compare_indexes) < 2:
+            return tuple(
+                str(self.result_rows[index]["team_color"]) for index in self.compare_indexes
+            ) + COMPARE_FALLBACK_COLORS[len(self.compare_indexes) :]
+        first, second = self.compare_indexes
+        return resolve_comparison_colors(
+            str(self.result_rows[first]["team_color"]),
+            str(self.result_rows[second]["team_color"]),
+        )
+
+    def clear_compare(self) -> None:
+        self.compare_indexes = []
+        self.refresh_compare_markers()
+        self.query_one(".comparison", Vertical).display = False
+        self.set_status("Comparison cleared.")
+
+    def toggle_compare(self) -> None:
+        table = self.query_one(".results", DataTable)
+        index = table.cursor_row
+        if not self.result_rows or index is None or index >= len(self.result_rows):
+            return
+
+        if index in self.compare_indexes:
+            self.compare_indexes.remove(index)
+        elif len(self.compare_indexes) >= len(COMPARE_SLOTS):
+            self.compare_indexes = [index]
+        else:
+            self.compare_indexes.append(index)
+
+        self.refresh_compare_markers()
+
+        if len(self.compare_indexes) < len(COMPARE_SLOTS):
+            self.query_one(".comparison", Vertical).display = False
+            names = [str(self.result_rows[i]["driver"]) for i in self.compare_indexes]
+            if names:
+                self.set_status(f"Marked {names[0]} as A. Press c on another driver to compare.")
+            else:
+                self.set_status("Press c on a driver row to mark it for comparison.")
+            return
+
+        self.run_worker(self.load_comparison(), exclusive=True)
+
+    async def load_comparison(self) -> None:
+        comparison = self.query_one(".comparison", Vertical)
+        graph = self.query_one(".compare-graph", Static)
+        metrics_table = self.query_one(".compare-metrics", DataTable)
+
+        rows = [self.result_rows[index] for index in self.compare_indexes]
+        names = [str(row["driver"]) for row in rows]
+        self.query_one(".driver-details", Static).display = False
+        comparison.display = True
+        graph.update(f"Loading comparison for {names[0]} vs {names[1]}...")
+        metrics_table.clear(columns=True)
+        self.set_status(f"Loading comparison for {names[0]} vs {names[1]}...")
+
+        try:
+            details = await asyncio.to_thread(
+                load_comparison_details,
+                self.year,
+                self.event_name,
+                self.session_type,
+                [str(row["driver_number"]) for row in rows],
+            )
+        except Exception as exc:
+            graph.update(f"Could not load comparison: {exc}")
+            self.set_status(f"Could not load comparison: {exc}")
+            return
+
+        colors = self.compare_colors_for_indexes()
+        graph.update(
+            make_comparison_lap_time_graph(
+                [
+                    {
+                        "label": str(row["abbreviation"]),
+                        "lap_times": detail["lap_times"],
+                        "color": color,
+                    }
+                    for row, detail, color in zip(rows, details, colors)
+                ]
+            )
+        )
+
+        metrics_table.clear(columns=True)
+        metrics_table.add_column("Metric", width=14)
+        for row, color in zip(rows, colors):
+            metrics_table.add_column(Text(str(row["abbreviation"]), style=f"bold {color}"), width=12)
+        metrics_table.add_column("Δ A-B", width=10)
+        for metric in build_comparison_metrics(details[0], details[1], self.session_type):
+            metrics_table.add_row(*metric)
+
+        self.set_status(f"Comparing {names[0]} vs {names[1]}.")
+
+    async def on_data_table_row_selected(self, event: DataTable.RowSelected) -> None:
+        if not event.data_table.has_class("results"):
+            return
+        if event.cursor_row >= len(self.result_rows):
+            return
+
+        row = self.result_rows[event.cursor_row]
+        details = self.query_one(".driver-details", Static)
+        driver = str(row["driver"])
+        driver_number = str(row["driver_number"])
+        self.query_one(".comparison", Vertical).display = False
+        details.display = True
+        details.update(f"Loading lap details for {driver}...")
+        self.set_status(f"Loading lap details for {driver}...")
+
+        try:
+            driver_details = await asyncio.to_thread(
+                load_driver_details,
+                self.year,
+                self.event_name,
+                self.session_type,
+                driver_number,
+            )
+        except Exception as exc:
+            details.update(f"Could not load driver details: {exc}")
+            self.set_status(f"Could not load driver details: {exc}")
+            return
+
+        details.update(render_driver_details(row, driver_details))
+        self.set_status(f"Loaded lap details for {driver}.")
+
+
 class F1ResultsApp(App):
     CSS = """
     Screen {
@@ -77,34 +292,34 @@ class F1ResultsApp(App):
         padding: 1;
     }
 
-    #results_area {
+    SessionResultsView {
         height: 1fr;
     }
 
-    #results {
+    .results {
         width: 1fr;
         height: 1fr;
     }
 
-    #driver_details {
+    .driver-details {
         width: 64;
         height: 1fr;
         padding: 1;
         border: solid green;
     }
 
-    #comparison {
+    .comparison {
         width: 66;
         height: 1fr;
         padding: 1;
         border: solid yellow;
     }
 
-    #compare_graph {
+    .compare-graph {
         height: auto;
     }
 
-    #compare_metrics {
+    .compare-metrics {
         height: auto;
         margin-top: 1;
     }
@@ -134,31 +349,21 @@ class F1ResultsApp(App):
             yield Select(SESSION_TYPES, value="R", id="session_type")
             yield Button("Load Results", variant="primary", id="load", disabled=True)
         yield Static("Select an event, then load results.", id="status")
-        with Horizontal(id="results_area"):
-            yield DataTable(id="results")
-            details = Static("", id="driver_details")
-            details.display = False
-            yield details
-            with Vertical(id="comparison"):
-                yield Static("", id="compare_graph")
-                yield DataTable(id="compare_metrics")
+        yield SessionResultsView()
         yield Static("Logs", id="log_title")
         yield RichLog(id="logs", markup=True, highlight=True)
         yield Footer()
 
-    def on_mount(self) -> None:
-        self.result_rows: list[dict[str, object]] = []
-        self.current_year = date.today().year
-        self.current_event_name = ""
-        self.current_session_type = "R"
-        self.event_names: list[str] = []
-        self.compare_indexes: list[int] = []
-        self.compare_column_key = None
-        self.result_row_keys: list[object] = []
+    @property
+    def results_view(self) -> SessionResultsView:
+        return self.query_one(SessionResultsView)
 
-        table = self.query_one("#results", DataTable)
-        table.cursor_type = "row"
-        self.query_one("#comparison", Vertical).display = False
+    def set_status(self, message: str) -> None:
+        self.query_one("#status", Static).update(message)
+
+    def on_mount(self) -> None:
+        self.event_names: list[str] = []
+        self.season_year = date.today().year
 
         self.log_handler = TextualLogHandler(self)
         self.log_handler.setFormatter(
@@ -177,7 +382,7 @@ class F1ResultsApp(App):
             logger.addHandler(self.log_handler)
             logger.setLevel(logging.INFO)
 
-        self.run_worker(self.load_current_year_events(), exclusive=True)
+        self.run_worker(self.load_startup_weekend(), exclusive=True)
 
     def on_unmount(self) -> None:
         if not hasattr(self, "log_handler"):
@@ -193,31 +398,61 @@ class F1ResultsApp(App):
         logs = self.query_one("#logs", RichLog)
         logs.write(message)
 
-    async def load_current_year_events(self) -> None:
-        year = date.today().year
+    async def load_startup_weekend(self) -> None:
         status = self.query_one("#status", Static)
         event_select = self.query_one("#event", Select)
+        session_select = self.query_one("#session_type", Select)
         load_button = self.query_one("#load", Button)
-        status.update(f"Loading {year} Grand Prix list...")
+        status.update("Finding the current race weekend...")
 
         try:
-            event_names = await asyncio.to_thread(load_event_names, year)
+            resolved = await asyncio.to_thread(resolve_startup_weekend, utc_now())
         except Exception as exc:
-            status.update(f"Could not load {year} Grand Prix list: {exc}")
+            status.update(f"Could not load the Grand Prix list: {exc}")
             return
 
+        event_names = list(resolved["event_names"])
         self.event_names = event_names
         event_select.set_options([(name, name) for name in event_names])
         if not event_names:
             event_select.disabled = True
             load_button.disabled = True
-            status.update(f"No {year} Grand Prix events found.")
+            status.update("No Grand Prix events found.")
             return
 
-        event_select.value = event_names[0]
         event_select.disabled = False
         load_button.disabled = False
-        status.update(f"Select a {year} Grand Prix, then load results.")
+
+        plan = resolved["plan"]
+        if plan is None:
+            event_select.value = event_names[0]
+            status.update("Select a Grand Prix, then load results.")
+            return
+
+        self.season_year = int(plan["year"])
+        event_name = str(plan["event_name"])
+        session_type = str(plan["default_session"])
+        event_select.value = event_name
+        if session_type in {value for _, value in SESSION_TYPES}:
+            session_select.value = session_type
+
+        await self.load_session(event_name, session_type)
+
+    async def load_session(self, event_name: str, session_type: str) -> None:
+        status = self.query_one("#status", Static)
+        year = self.season_year
+        status.update(f"Loading {year} {event_name} {session_type} results...")
+
+        try:
+            rows = await asyncio.to_thread(load_results, year, event_name, session_type)
+        except Exception as exc:
+            status.update(f"Could not load results: {exc}")
+            return
+
+        view = self.results_view
+        view.set_context(year, event_name, session_type)
+        view.show_results(rows)
+        status.update(f"Loaded {len(rows)} result rows for {event_name} {session_type}.")
 
     def is_valid_event_name(self, value: object) -> bool:
         return isinstance(value, str) and value in self.event_names
@@ -237,7 +472,6 @@ class F1ResultsApp(App):
         session_select = self.query_one("#session_type", Select)
         status = self.query_one("#status", Static)
 
-        year = date.today().year
         event_value = event_select.value
         if not self.is_valid_event_name(event_value):
             load_button = self.query_one("#load", Button)
@@ -245,194 +479,101 @@ class F1ResultsApp(App):
             status.update("Select a Grand Prix before loading results.")
             return
 
-        event_name = str(event_value)
-        session_type = str(session_select.value)
-        status.update(f"Loading {year} {event_name} {session_type} results...")
-
-        try:
-            rows = await asyncio.to_thread(load_results, year, event_name, session_type)
-        except Exception as exc:
-            status.update(f"Could not load results: {exc}")
-            return
-
-        self.current_year = year
-        self.current_event_name = event_name
-        self.current_session_type = session_type
-        self.show_results(rows)
-        status.update(f"Loaded {len(rows)} result rows.")
-
-    def show_results(self, rows: list[dict[str, object]]) -> None:
-        self.result_rows = rows
-        self.compare_indexes = []
-        details = self.query_one("#driver_details", Static)
-        details.display = False
-        details.update("")
-        self.query_one("#comparison", Vertical).display = False
-
-        table = self.query_one("#results", DataTable)
-        table.clear(columns=True)
-        column_keys = table.add_columns("Cmp", "Pos", "No", "Driver", "Team", "Status", "Time")
-        self.compare_column_key = column_keys[0]
-
-        self.result_row_keys = [
-            table.add_row(
-                "",
-                format_position_cell(row["position"]),
-                str(row["number"]),
-                str(row["driver"]),
-                Text(str(row["team"]), style=str(row["team_color"])),
-                str(row["status"]),
-                str(row["time"]),
-                key=str(row["driver_number"]),
-            )
-            for row in rows
-        ]
-
-    def refresh_compare_markers(self) -> None:
-        table = self.query_one("#results", DataTable)
-        if self.compare_column_key is None:
-            return
-
-        colors = self.compare_colors_for_indexes()
-        for index, row_key in enumerate(self.result_row_keys):
-            marker = ""
-            if index in self.compare_indexes:
-                slot = self.compare_indexes.index(index)
-                marker = Text(COMPARE_SLOTS[slot], style=f"bold {colors[slot]}")
-            table.update_cell(row_key, self.compare_column_key, marker)
-
-    def compare_colors_for_indexes(self) -> tuple[str, str]:
-        if len(self.compare_indexes) < 2:
-            return tuple(
-                str(self.result_rows[index]["team_color"]) for index in self.compare_indexes
-            ) + COMPARE_FALLBACK_COLORS[len(self.compare_indexes) :]
-        first, second = self.compare_indexes
-        return resolve_comparison_colors(
-            str(self.result_rows[first]["team_color"]),
-            str(self.result_rows[second]["team_color"]),
-        )
-
-    def action_clear_compare(self) -> None:
-        self.compare_indexes = []
-        self.refresh_compare_markers()
-        self.query_one("#comparison", Vertical).display = False
-        self.query_one("#status", Static).update("Comparison cleared.")
+        await self.load_session(str(event_value), str(session_select.value))
 
     def action_toggle_compare(self) -> None:
-        table = self.query_one("#results", DataTable)
-        status = self.query_one("#status", Static)
-        index = table.cursor_row
-        if not self.result_rows or index is None or index >= len(self.result_rows):
-            return
+        self.results_view.toggle_compare()
 
-        if index in self.compare_indexes:
-            self.compare_indexes.remove(index)
-        elif len(self.compare_indexes) >= len(COMPARE_SLOTS):
-            self.compare_indexes = [index]
-        else:
-            self.compare_indexes.append(index)
-
-        self.refresh_compare_markers()
-
-        if len(self.compare_indexes) < len(COMPARE_SLOTS):
-            self.query_one("#comparison", Vertical).display = False
-            names = [str(self.result_rows[i]["driver"]) for i in self.compare_indexes]
-            if names:
-                status.update(f"Marked {names[0]} as A. Press c on another driver to compare.")
-            else:
-                status.update("Press c on a driver row to mark it for comparison.")
-            return
-
-        self.run_worker(self.load_comparison(), exclusive=True)
-
-    async def load_comparison(self) -> None:
-        status = self.query_one("#status", Static)
-        comparison = self.query_one("#comparison", Vertical)
-        graph = self.query_one("#compare_graph", Static)
-        metrics_table = self.query_one("#compare_metrics", DataTable)
-
-        rows = [self.result_rows[index] for index in self.compare_indexes]
-        names = [str(row["driver"]) for row in rows]
-        self.query_one("#driver_details", Static).display = False
-        comparison.display = True
-        graph.update(f"Loading comparison for {names[0]} vs {names[1]}...")
-        metrics_table.clear(columns=True)
-        status.update(f"Loading comparison for {names[0]} vs {names[1]}...")
-
-        try:
-            details = await asyncio.to_thread(
-                load_comparison_details,
-                self.current_year,
-                self.current_event_name,
-                self.current_session_type,
-                [str(row["driver_number"]) for row in rows],
-            )
-        except Exception as exc:
-            graph.update(f"Could not load comparison: {exc}")
-            status.update(f"Could not load comparison: {exc}")
-            return
-
-        colors = self.compare_colors_for_indexes()
-        graph.update(
-            make_comparison_lap_time_graph(
-                [
-                    {
-                        "label": str(row["abbreviation"]),
-                        "lap_times": detail["lap_times"],
-                        "color": color,
-                    }
-                    for row, detail, color in zip(rows, details, colors)
-                ]
-            )
-        )
-
-        metrics_table.clear(columns=True)
-        metrics_table.add_column("Metric", width=14)
-        for row, color in zip(rows, colors):
-            metrics_table.add_column(Text(str(row["abbreviation"]), style=f"bold {color}"), width=12)
-        metrics_table.add_column("Δ A-B", width=10)
-        for metric in build_comparison_metrics(
-            details[0], details[1], self.current_session_type
-        ):
-            metrics_table.add_row(*metric)
-
-        status.update(f"Comparing {names[0]} vs {names[1]}.")
-
-    async def on_data_table_row_selected(self, event: DataTable.RowSelected) -> None:
-        if event.data_table.id != "results" or event.cursor_row >= len(self.result_rows):
-            return
-
-        row = self.result_rows[event.cursor_row]
-        details = self.query_one("#driver_details", Static)
-        status = self.query_one("#status", Static)
-        driver = str(row["driver"])
-        driver_number = str(row["driver_number"])
-        self.query_one("#comparison", Vertical).display = False
-        details.display = True
-        details.update(f"Loading lap details for {driver}...")
-        status.update(f"Loading lap details for {driver}...")
-
-        try:
-            driver_details = await asyncio.to_thread(
-                load_driver_details,
-                self.current_year,
-                self.current_event_name,
-                self.current_session_type,
-                driver_number,
-            )
-        except Exception as exc:
-            details.update(f"Could not load driver details: {exc}")
-            status.update(f"Could not load driver details: {exc}")
-            return
-
-        details.update(render_driver_details(row, driver_details))
-        status.update(f"Loaded lap details for {driver}.")
+    def action_clear_compare(self) -> None:
+        self.results_view.clear_compare()
 
 
 def load_event_names(year: int) -> list[str]:
     schedule = fastf1.get_event_schedule(year)
     schedule = schedule[schedule["RoundNumber"] > 0]
     return [str(name) for name in schedule["EventName"].tolist()]
+
+
+def event_names_of(schedule: object) -> list[str]:
+    rounds = schedule[schedule["RoundNumber"] > 0]
+    return [str(name) for name in rounds["EventName"].tolist()]
+
+
+def utc_now() -> object:
+    return pd.Timestamp.utcnow().tz_localize(None)
+
+
+def session_code(name: str) -> str:
+    return SESSION_CODES.get(name, name)
+
+
+def weekend_sessions(event: object) -> list[dict[str, object]]:
+    """Read one schedule row's sessions, earliest first.
+
+    The session set is a property of the weekend's format, not a fixed list:
+    sprint weekends carry Sprint Qualifying and Sprint in place of FP2 and FP3.
+    """
+    sessions: list[dict[str, object]] = []
+    for slot in range(1, SESSION_SLOT_COUNT + 1):
+        name = event.get(f"Session{slot}")
+        start = event.get(f"Session{slot}DateUtc")
+        if not isinstance(name, str) or not name:
+            continue
+        if start is None or start != start:
+            continue
+        sessions.append(
+            {
+                "code": session_code(name),
+                "name": name,
+                "start": start,
+            }
+        )
+    sessions.sort(key=lambda session: session["start"])
+    return sessions
+
+
+def build_weekend_plan(schedule: object, now: object) -> dict[str, object] | None:
+    """Describe the most recent weekend that has started, or None if none has.
+
+    "Started" means the weekend's first session is in the past, so during a race
+    weekend this picks that weekend rather than the previously completed round.
+    Feeding this the previous season's schedule yields its final round, which is
+    how the off-season falls back.
+    """
+    rounds = schedule[schedule["RoundNumber"] > 0]
+
+    chosen = None
+    for _, event in rounds.iterrows():
+        sessions = weekend_sessions(event)
+        if not sessions or sessions[0]["start"] > now:
+            continue
+        if chosen is None or sessions[0]["start"] > chosen[0]:
+            chosen = (sessions[0]["start"], event, sessions)
+
+    if chosen is None:
+        return None
+
+    _, event, sessions = chosen
+    for session in sessions:
+        session["has_started"] = bool(session["start"] <= now)
+    started = [session for session in sessions if session["has_started"]]
+
+    return {
+        "year": int(event["EventDate"].year),
+        "event_name": str(event["EventName"]),
+        "sessions": sessions,
+        "default_session": str(started[-1]["code"]),
+    }
+
+
+def resolve_startup_weekend(now: object) -> dict[str, object]:
+    """Resolve the weekend to open on, falling back to last season out of season."""
+    schedule = fastf1.get_event_schedule(now.year)
+    plan = build_weekend_plan(schedule, now)
+    if plan is None:
+        schedule = fastf1.get_event_schedule(now.year - 1)
+        plan = build_weekend_plan(schedule, now)
+    return {"plan": plan, "event_names": event_names_of(schedule)}
 
 
 TEAM_COLOR_FALLBACKS = {

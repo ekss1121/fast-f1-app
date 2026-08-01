@@ -7,6 +7,7 @@ from textual.widgets import Select
 from fast_f1_app import (
     build_comparison_metrics,
     build_qualifying_details,
+    build_weekend_plan,
     F1ResultsApp,
     format_compounds,
     format_lap_time,
@@ -238,6 +239,131 @@ class PositionTests(unittest.TestCase):
 
     def test_blank_position_renders_as_an_empty_cell(self):
         self.assertEqual(format_position_cell(to_position("")).plain, "")
+
+
+def make_event(round_number, name, year, first_day, sessions):
+    """Build one schedule row; sessions is a list of (name, day offset, hour)."""
+    row = {
+        "RoundNumber": round_number,
+        "EventName": name,
+        "EventDate": pd.Timestamp(f"{year}-{first_day}") + pd.Timedelta(days=2),
+    }
+    for slot in range(1, 6):
+        if slot <= len(sessions):
+            session_name, day_offset, hour = sessions[slot - 1]
+            row[f"Session{slot}"] = session_name
+            row[f"Session{slot}DateUtc"] = (
+                pd.Timestamp(f"{year}-{first_day}")
+                + pd.Timedelta(days=day_offset, hours=hour)
+            )
+        else:
+            row[f"Session{slot}"] = None
+            row[f"Session{slot}DateUtc"] = pd.NaT
+    return row
+
+
+CONVENTIONAL = [
+    ("Practice 1", 0, 12),
+    ("Practice 2", 0, 16),
+    ("Practice 3", 1, 12),
+    ("Qualifying", 1, 16),
+    ("Race", 2, 14),
+]
+SPRINT = [
+    ("Practice 1", 0, 12),
+    ("Sprint Qualifying", 0, 16),
+    ("Sprint", 1, 12),
+    ("Qualifying", 1, 16),
+    ("Race", 2, 14),
+]
+
+
+def make_schedule(events):
+    return pd.DataFrame([{"RoundNumber": 0, "EventName": "Pre-Season Testing",
+                          "EventDate": pd.Timestamp("2026-02-01"),
+                          **{f"Session{s}": None for s in range(1, 6)},
+                          **{f"Session{s}DateUtc": pd.NaT for s in range(1, 6)}}] + events)
+
+
+class WeekendPlanTests(unittest.TestCase):
+    def test_conventional_weekend_lists_five_sessions_in_schedule_order(self):
+        schedule = make_schedule([make_event(1, "Australian Grand Prix", 2026, "03-06", CONVENTIONAL)])
+
+        plan = build_weekend_plan(schedule, pd.Timestamp("2026-03-10 00:00"))
+
+        self.assertEqual(plan["event_name"], "Australian Grand Prix")
+        self.assertEqual(plan["year"], 2026)
+        self.assertEqual(
+            [session["code"] for session in plan["sessions"]],
+            ["FP1", "FP2", "FP3", "Q", "R"],
+        )
+        self.assertEqual(plan["default_session"], "R")
+
+    def test_sprint_weekend_swaps_practice_for_sprint_sessions(self):
+        schedule = make_schedule([make_event(1, "Chinese Grand Prix", 2026, "03-13", SPRINT)])
+
+        plan = build_weekend_plan(schedule, pd.Timestamp("2026-03-17 00:00"))
+
+        codes = [session["code"] for session in plan["sessions"]]
+        self.assertEqual(codes, ["FP1", "SQ", "S", "Q", "R"])
+        self.assertNotIn("FP2", codes)
+        self.assertNotIn("FP3", codes)
+
+    def test_mid_weekend_marks_future_sessions_and_defaults_to_last_finished(self):
+        schedule = make_schedule([make_event(1, "Australian Grand Prix", 2026, "03-06", CONVENTIONAL)])
+
+        # Saturday evening: qualifying has run, the race has not.
+        plan = build_weekend_plan(schedule, pd.Timestamp("2026-03-07 18:00"))
+
+        started = {session["code"]: session["has_started"] for session in plan["sessions"]}
+        self.assertEqual(started, {"FP1": True, "FP2": True, "FP3": True, "Q": True, "R": False})
+        self.assertEqual(plan["default_session"], "Q")
+
+    def test_between_rounds_picks_the_most_recently_started_weekend(self):
+        schedule = make_schedule([
+            make_event(1, "Australian Grand Prix", 2026, "03-06", CONVENTIONAL),
+            make_event(2, "Chinese Grand Prix", 2026, "03-13", SPRINT),
+        ])
+
+        plan = build_weekend_plan(schedule, pd.Timestamp("2026-03-18 00:00"))
+
+        self.assertEqual(plan["event_name"], "Chinese Grand Prix")
+        self.assertEqual(plan["default_session"], "R")
+
+    def test_an_upcoming_weekend_is_not_chosen_before_it_starts(self):
+        schedule = make_schedule([
+            make_event(1, "Australian Grand Prix", 2026, "03-06", CONVENTIONAL),
+            make_event(2, "Chinese Grand Prix", 2026, "03-13", SPRINT),
+        ])
+
+        plan = build_weekend_plan(schedule, pd.Timestamp("2026-03-11 00:00"))
+
+        self.assertEqual(plan["event_name"], "Australian Grand Prix")
+
+    def test_returns_none_before_the_seasons_first_session(self):
+        schedule = make_schedule([make_event(1, "Australian Grand Prix", 2026, "03-06", CONVENTIONAL)])
+
+        self.assertIsNone(build_weekend_plan(schedule, pd.Timestamp("2026-01-15 00:00")))
+
+    def test_previous_seasons_schedule_yields_its_final_round(self):
+        # How the off-season fallback works: the same call, fed last season.
+        schedule = make_schedule([
+            make_event(1, "Australian Grand Prix", 2025, "03-14", CONVENTIONAL),
+            make_event(24, "Abu Dhabi Grand Prix", 2025, "12-05", CONVENTIONAL),
+        ])
+
+        plan = build_weekend_plan(schedule, pd.Timestamp("2026-01-15 00:00"))
+
+        self.assertEqual(plan["event_name"], "Abu Dhabi Grand Prix")
+        self.assertEqual(plan["year"], 2025)
+        self.assertEqual(plan["default_session"], "R")
+
+    def test_testing_events_are_ignored(self):
+        schedule = make_schedule([make_event(1, "Australian Grand Prix", 2026, "03-06", CONVENTIONAL)])
+
+        plan = build_weekend_plan(schedule, pd.Timestamp("2026-03-10 00:00"))
+
+        self.assertNotEqual(plan["event_name"], "Pre-Season Testing")
 
 
 class EventValidationTests(unittest.TestCase):
