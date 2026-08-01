@@ -85,11 +85,15 @@ class SessionResultsView(Horizontal):
         self.event_name = ""
         self.session_type = "R"
         self.session_name = ""
+        self.session_start = None
         self.has_started = True
         self.loaded = False
         self.is_loading = False
 
     def compose(self) -> ComposeResult:
+        message = Static("", classes="session-message")
+        message.display = False
+        yield message
         yield DataTable(classes="results")
         details = Static("", classes="driver-details")
         details.display = False
@@ -101,6 +105,7 @@ class SessionResultsView(Horizontal):
     def on_mount(self) -> None:
         self.query_one(".results", DataTable).cursor_type = "row"
         self.query_one(".comparison", Vertical).display = False
+        self.query_one(".session-message", Static).display = False
 
     def set_status(self, message: str) -> None:
         self.app.set_status(message)
@@ -110,13 +115,32 @@ class SessionResultsView(Horizontal):
         self.event_name = event_name
         self.session_type = str(session["code"])
         self.session_name = str(session["name"])
+        self.session_start = session.get("start")
         self.has_started = bool(session.get("has_started", True))
         self.loaded = False
         self.is_loading = False
 
+    def show_message(self, message: str) -> None:
+        """Give the whole tab over to one message: not started yet, or failed.
+
+        Kept inside the view so a session that cannot be shown says so where the
+        user is looking, and leaves the other tabs untouched.
+        """
+        self.result_rows = []
+        self.compare_indexes = []
+        self.result_row_keys = []
+        self.query_one(".results", DataTable).display = False
+        self.query_one(".driver-details", Static).display = False
+        self.query_one(".comparison", Vertical).display = False
+        panel = self.query_one(".session-message", Static)
+        panel.display = True
+        panel.update(message)
+
     def show_results(self, rows: list[dict[str, object]]) -> None:
         self.result_rows = rows
         self.compare_indexes = []
+        self.query_one(".session-message", Static).display = False
+        self.query_one(".results", DataTable).display = True
         details = self.query_one(".driver-details", Static)
         details.display = False
         details.update("")
@@ -317,6 +341,12 @@ class F1ResultsApp(App):
         height: 1fr;
     }
 
+    .session-message {
+        width: 1fr;
+        height: 1fr;
+        padding: 1 2;
+    }
+
     .driver-details {
         width: 64;
         height: 1fr;
@@ -428,7 +458,7 @@ class F1ResultsApp(App):
         try:
             resolved = await asyncio.to_thread(resolve_startup_weekend, utc_now())
         except Exception as exc:
-            status.update(f"Could not load the Grand Prix list: {exc}")
+            status.update(format_schedule_error(utc_now().year, exc))
             return
 
         self.schedule = resolved["schedule"]
@@ -438,7 +468,7 @@ class F1ResultsApp(App):
         if not event_names:
             event_select.disabled = True
             load_button.disabled = True
-            status.update("No Grand Prix events found.")
+            status.update(format_empty_season_message(int(resolved["year"])))
             return
 
         event_select.disabled = False
@@ -484,6 +514,11 @@ class F1ResultsApp(App):
             return
 
         status = self.query_one("#status", Static)
+        if not view.has_started:
+            view.show_message(format_not_started_message(view.session_name, view.session_start))
+            status.update(format_not_started_status(view.session_name, view.session_start))
+            return
+
         view.is_loading = True
         view.loading = True
         status.update(f"Loading {view.event_name} {view.session_name}...")
@@ -493,8 +528,10 @@ class F1ResultsApp(App):
                 load_results, view.year, view.event_name, view.session_type
             )
         except Exception as exc:
+            # Left unloaded on purpose: coming back to the tab retries.
             view.is_loading = False
             view.loading = False
+            view.show_message(format_session_error(view.session_name, exc))
             status.update(f"Could not load {view.session_name}: {exc}")
             return
 
@@ -652,16 +689,63 @@ def build_weekend_plan(schedule: object, now: object) -> dict[str, object] | Non
 
 def resolve_startup_weekend(now: object) -> dict[str, object]:
     """Resolve the weekend to open on, falling back to last season out of season."""
-    schedule = fastf1.get_event_schedule(now.year)
+    year = now.year
+    schedule = fastf1.get_event_schedule(year)
     plan = build_weekend_plan(schedule, now)
     if plan is None:
-        schedule = fastf1.get_event_schedule(now.year - 1)
+        year = now.year - 1
+        schedule = fastf1.get_event_schedule(year)
         plan = build_weekend_plan(schedule, now)
     return {
         "plan": plan,
         "event_names": event_names_of(schedule),
         "schedule": schedule,
+        "year": year,
     }
+
+
+def format_session_start(start: object) -> str:
+    """Spell out a session's scheduled start; schedule times are UTC-naive."""
+    if start is None:
+        return "an unannounced time"
+    try:
+        if start != start:
+            return "an unannounced time"
+    except Exception:
+        pass
+    return pd.Timestamp(start).strftime("%a %d %b %Y %H:%M") + " UTC"
+
+
+def format_not_started_message(session_name: str, start: object) -> str:
+    return (
+        f"{session_name} has not started yet.\n\n"
+        f"Scheduled to start at {format_session_start(start)}.\n\n"
+        "Results will be available once the session has run."
+    )
+
+
+def format_not_started_status(session_name: str, start: object) -> str:
+    return f"{session_name} has not started yet - scheduled for {format_session_start(start)}."
+
+
+def format_session_error(session_name: str, error: object) -> str:
+    return (
+        f"Could not load {session_name}.\n\n"
+        f"{error}\n\n"
+        "The other sessions of this weekend are unaffected. "
+        "Switch to another tab and back to try this one again."
+    )
+
+
+def format_schedule_error(year: int, error: object) -> str:
+    """Distinct from an empty season: the fetch itself failed."""
+    # The lead clause carries the distinction, since the status line is one line
+    # tall and a library error message can be long enough to be clipped.
+    return f"Could not fetch the {year} race schedule - no events could be listed. {error}"
+
+
+def format_empty_season_message(year: int) -> str:
+    return f"The {year} race schedule was fetched successfully but lists no Grand Prix events."
 
 
 TEAM_COLOR_FALLBACKS = {

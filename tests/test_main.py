@@ -10,10 +10,16 @@ from fast_f1_app import (
     build_weekend_plan,
     F1ResultsApp,
     format_compounds,
+    format_empty_season_message,
     format_lap_time,
+    format_not_started_message,
+    format_not_started_status,
     format_position_cell,
     format_qualifying_time,
     format_result_time,
+    format_schedule_error,
+    format_session_error,
+    format_session_start,
     make_comparison_lap_time_graph,
     make_lap_time_graph,
     make_y_ticks,
@@ -364,6 +370,45 @@ class WeekendPlanTests(unittest.TestCase):
         plan = build_weekend_plan(schedule, pd.Timestamp("2026-03-10 00:00"))
 
         self.assertNotEqual(plan["event_name"], "Pre-Season Testing")
+
+
+class TabStateMessageTests(unittest.TestCase):
+    def test_not_started_message_names_the_session_and_its_start_time(self):
+        message = format_not_started_message("Race", pd.Timestamp("2026-08-23 13:00"))
+
+        self.assertIn("Race has not started yet", message)
+        self.assertIn("Sun 23 Aug 2026 13:00 UTC", message)
+
+    def test_not_started_status_is_a_one_line_version_of_the_same_thing(self):
+        status = format_not_started_status("Qualifying", pd.Timestamp("2026-08-22 14:00"))
+
+        self.assertNotIn("\n", status)
+        self.assertIn("Qualifying", status)
+        self.assertIn("Sat 22 Aug 2026 14:00 UTC", status)
+
+    def test_a_session_without_a_published_start_time_still_reads_sensibly(self):
+        for start in (None, pd.NaT):
+            with self.subTest(start=start):
+                self.assertEqual(format_session_start(start), "an unannounced time")
+                self.assertIn("an unannounced time", format_not_started_message("Sprint", start))
+
+    def test_session_error_reports_the_failure_and_how_to_retry(self):
+        message = format_session_error("Practice 2", ValueError("no data for this session"))
+
+        self.assertIn("Could not load Practice 2", message)
+        self.assertIn("no data for this session", message)
+        self.assertIn("unaffected", message)
+        self.assertIn("again", message)
+
+    def test_schedule_fetch_failure_reads_differently_from_an_empty_season(self):
+        failure = format_schedule_error(2026, ConnectionError("name resolution failed"))
+        empty = format_empty_season_message(2026)
+
+        self.assertIn("name resolution failed", failure)
+        self.assertNotIn("name resolution failed", empty)
+        self.assertIn("no Grand Prix events", empty)
+        self.assertNotIn("no Grand Prix events", failure)
+        self.assertNotEqual(failure, empty)
 
 
 class EventValidationTests(unittest.TestCase):
