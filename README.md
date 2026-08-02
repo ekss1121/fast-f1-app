@@ -1,5 +1,10 @@
 # Fast F1 App
 
+[![tests](https://img.shields.io/github/actions/workflow/status/ekss1121/fast-f1-app/tests.yml?branch=main&label=tests)](https://github.com/ekss1121/fast-f1-app/actions/workflows/tests.yml)
+[![PyPI](https://img.shields.io/pypi/v/fast-f1-app)](https://pypi.org/project/fast-f1-app/)
+[![Python versions](https://img.shields.io/pypi/pyversions/fast-f1-app)](https://pypi.org/project/fast-f1-app/)
+[![License](https://img.shields.io/pypi/l/fast-f1-app)](https://github.com/ekss1121/fast-f1-app/blob/main/LICENSE)
+
 A small Textual terminal app for browsing current-season Formula 1 event results with FastF1.
 
 This is an unofficial project. It is not associated in any way with Formula 1, the FIA, or any of their affiliates. F1, FORMULA 1 and related marks are trademarks of Formula One Licensing B.V.
