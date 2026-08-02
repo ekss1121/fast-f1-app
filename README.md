@@ -20,15 +20,25 @@ This is an unofficial project. It is not associated in any way with Formula 1, t
 Install it as a standalone command available from any directory:
 
 ```bash
-uv tool install .
+uv tool install fast-f1-app
 fast-f1-app
 ```
 
 This builds an isolated environment for the app, so it does not touch your system Python. The executable lands in `~/.local/bin` (`C:\Users\<you>\.local\bin` on Windows); if the command is not found, run `uv tool update-shell` and restart your terminal.
 
-`uv tool install .` installs a *copy*, so changes to the source will not appear until you re-run it. To have the command track your working tree instead, use `uv tool install --editable .`. To remove it, `uv tool uninstall fast-f1-app`.
+To move to a newer release later, `uv tool upgrade fast-f1-app`. To remove it, `uv tool uninstall fast-f1-app`.
 
-If you prefer pipx: `pipx install .` works the same way.
+If you prefer pipx: `pipx install fast-f1-app` works the same way.
+
+### From a checkout
+
+To install the version in your working tree rather than the published one, run the same command against the directory:
+
+```bash
+uv tool install .
+```
+
+That installs a *copy*, so changes to the source will not appear until you re-run it. `uv tool install --editable .` makes the command track your working tree instead.
 
 ## Run from a checkout
 
