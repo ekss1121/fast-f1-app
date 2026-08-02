@@ -1,0 +1,62 @@
+name: Tests
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+  # Exposed so the release pipeline runs this exact matrix instead of restating it.
+  workflow_call:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    strategy:
+      # One red cell should not hide the state of the other three.
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+        python-version: ["3.12", "3.13"]
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Set up uv and Python ${{ matrix.python-version }}
+        uses: astral-sh/setup-uv@v9
+        with:
+          python-version: ${{ matrix.python-version }}
+          enable-cache: true
+          cache-dependency-glob: uv.lock
+
+      - name: Install dependencies from the lockfile
+        # --locked fails rather than silently updating uv.lock, so a run reflects
+        # the project's pinned dependencies and not whatever released this morning.
+        run: uv sync --locked
+
+      - name: Run tests
+        run: uv run --no-sync python -m unittest discover -s tests
+
+  all-tests-passed:
+    # The single check branch protection requires. Named jobs in the matrix carry
+    # their parameters in the name, so requiring those by name would break every
+    # pull request the moment the matrix changes.
+    needs: test
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    steps:
+      - name: Check the matrix result
+        # `needs.test.result` is 'success' only when every matrix job succeeded.
+        # Anything else — failure, cancellation, or a job that never ran — is a fail.
+        if: needs.test.result != 'success'
+        run: |
+          echo "Test matrix result: ${{ needs.test.result }}"
+          exit 1
+
+      - name: Report success
+        run: echo "Every matrix job passed."
