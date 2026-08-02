@@ -504,3 +504,8 @@ class EventValidationTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TemporaryBranchProtectionProbe(unittest.TestCase):
+    def test_deliberate_failure(self):
+        self.fail("temporary: proving branch protection blocks a red pull request")
