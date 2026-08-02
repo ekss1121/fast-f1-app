@@ -8,6 +8,9 @@ license = "MIT"
 license-files = ["LICENSE"]
 authors = [{ name = "Zhihang Liu" }]
 keywords = ["formula1", "f1", "fastf1", "motorsport", "textual", "tui"]
+# No "License :: OSI Approved" classifier on purpose: core metadata 2.4 treats a
+# licence classifier alongside the SPDX `license` expression above as an error,
+# and PyPI rejects the upload.
 classifiers = [
     "Development Status :: 3 - Alpha",
     "Environment :: Console",
@@ -34,11 +37,15 @@ Issues = "https://github.com/ekss1121/fast-f1-app/issues"
 fast-f1-app = "fast_f1_app:main"
 
 [build-system]
-requires = ["hatchling"]
+# 1.26.0 is where hatchling learned core metadata 2.4 — the SPDX `license`
+# expression and glob-style `license-files` above need it. An older backend
+# resolved in a fresh build environment would fail on them.
+requires = ["hatchling>=1.26.3"]
 build-backend = "hatchling.build"
 
 # Without this, hatchling sweeps the whole working tree into the sdist —
-# editor settings, agent config and all. Ship only what builds and tests the app.
+# editor settings, agent config and all. Ship only what builds and tests the
+# app; hatchling adds .gitignore on top regardless.
 [tool.hatch.build.targets.sdist]
 include = [
     "fast_f1_app.py",
