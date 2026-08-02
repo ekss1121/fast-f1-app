@@ -2,7 +2,9 @@
 
 A small Textual terminal app for browsing current-season Formula 1 event results with FastF1.
 
-![The app showing the 2026 Belgian Grand Prix race classification with a two-driver comparison](docs/app_screenshot.png)
+This is an unofficial project. It is not associated in any way with Formula 1, the FIA, or any of their affiliates. F1, FORMULA 1 and related marks are trademarks of Formula One Licensing B.V.
+
+![The app showing the 2026 Belgian Grand Prix race classification with a two-driver comparison](https://raw.githubusercontent.com/ekss1121/fast-f1-app/main/docs/app_screenshot.png)
 
 ## What you get
 
@@ -61,3 +63,7 @@ Pressing `c` on a third driver starts a fresh comparison from that driver.
 ```bash
 uv run python -m unittest discover -s tests
 ```
+
+## License
+
+MIT — see [LICENSE](LICENSE).
