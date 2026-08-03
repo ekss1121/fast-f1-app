@@ -59,6 +59,8 @@ The app opens on the current weekend with its first session loaded. Pick a diffe
 
 Selecting a result row loads lap details for that driver. FastF1 caches session data, so the first load of a session is slow and later ones are quick.
 
+The lap-time graphs and the fastest/slowest/average figures are built from *clean* laps only — pit in and out laps, and laps run under a safety car, VSC or red flag, are left out. A single out-lap is around twenty seconds off the pace, which is enough to stretch the axis and flatten every racing lap onto one row. The panel says how many laps were excluded, `Laps` still counts every lap completed, and the graph keeps real lap numbers on the x axis, so the excluded laps show up as gaps.
+
 | Key | Action |
 | --- | --- |
 | `Enter` | Show details for the highlighted driver |
@@ -69,7 +71,9 @@ Selecting a result row loads lap details for that driver. FastF1 caches session 
 
 ### Comparing two drivers
 
-Marking a second driver with `c` opens the comparison view, as in the screenshot above: both drivers' lap times on one scatter graph — coloured by team, falling back to cyan/magenta when teammates share a colour — plus a side-by-side table of laps, fastest/slowest/average lap, stops and compounds, with the A−B delta in the last column. Qualifying comparisons also list each driver's delta to pole and their sector times with sector-by-sector deltas.
+Marking a second driver with `c` opens the comparison view, as in the screenshot above: a per-lap delta graph of `B − A`, with each lap coloured by whoever was quicker — team colours, falling back to cyan/magenta when teammates share one — plus a side-by-side table of laps, clean laps, fastest/slowest/average lap, stops and compounds, with the A−B delta in the last column. Qualifying comparisons also list each driver's delta to pole and their sector times with sector-by-sector deltas.
+
+The graph plots the difference rather than both drivers' lap times together because two drivers are usually within a second of each other while the axis has to span several, so overlaid series land on the same rows and cannot be told apart. Only laps *both* drivers ran cleanly get a delta.
 
 Pressing `c` on a third driver starts a fresh comparison from that driver.
 
