@@ -10,6 +10,7 @@ from fast_f1_app import (
     build_qualifying_details,
     build_weekend_plan,
     extract_driver_details,
+    extract_track_map,
     F1ResultsApp,
     format_compounds,
     format_empty_season_message,
@@ -21,16 +22,24 @@ from fast_f1_app import (
     format_result_time,
     format_schedule_error,
     format_session_error,
+    format_circuit_location,
     format_session_start,
+    format_track_error,
     has_official_classification,
     make_comparison_lap_time_graph,
     make_lap_time_graph,
     make_y_ticks,
+    pick_geometry_lap,
     render_driver_details,
+    render_track_panel,
     resolve_comparison_colors,
     select_clean_laps,
     to_plot_color,
     to_position,
+    TRACK_CONTENT_HEIGHT,
+    TRACK_CONTENT_WIDTH,
+    TRACK_GUTTER,
+    TRACK_TEXT_WIDTH,
 )
 
 
@@ -639,6 +648,360 @@ class EventValidationTests(unittest.TestCase):
         self.assertFalse(app.is_valid_event_name(Select.BLANK))
         self.assertFalse(app.is_valid_event_name(None))
         self.assertFalse(app.is_valid_event_name("Unknown Grand Prix"))
+
+
+def square_lap_position_data(points_per_side=25):
+    """One closed 100 m square lap, in the tenths of a metre the position API reports.
+
+    Square on purpose: the aspect correction is the easiest thing to get silently
+    wrong, and a square is the shape that shows it. Held away from the origin
+    because (0, 0) is the API's no-fix placeholder and gets filtered out.
+    """
+    side = 1000.0
+    origin = 1000.0
+    xs: list[float] = []
+    ys: list[float] = []
+    for step in range(points_per_side):
+        xs.append(origin + side * step / points_per_side)
+        ys.append(origin)
+    for step in range(points_per_side):
+        xs.append(origin + side)
+        ys.append(origin + side * step / points_per_side)
+    for step in range(points_per_side):
+        xs.append(origin + side - side * step / points_per_side)
+        ys.append(origin + side)
+    for step in range(points_per_side):
+        xs.append(origin)
+        ys.append(origin + side - side * step / points_per_side)
+    xs.append(origin)
+    ys.append(origin)
+    return pd.DataFrame(
+        {
+            "Time": [pd.Timedelta(seconds=index) for index in range(len(xs))],
+            "X": xs,
+            "Y": ys,
+        }
+    )
+
+
+def square_lap(sample_count=101):
+    last = sample_count - 1
+    return pd.Series(
+        {
+            "LapStartTime": pd.Timedelta(seconds=0),
+            "LapTime": pd.Timedelta(seconds=last),
+            "Sector1SessionTime": pd.Timedelta(seconds=last / 3),
+            "Sector2SessionTime": pd.Timedelta(seconds=2 * last / 3),
+        }
+    )
+
+
+def marker_cells(text, marker="•"):
+    cells = []
+    for row, line in enumerate(text.plain.split("\n")):
+        for column, character in enumerate(line):
+            if character == marker:
+                cells.append((row, column))
+    return cells
+
+
+def span_style_counts(text):
+    counts = {}
+    for span in text.spans:
+        counts[str(span.style)] = counts.get(str(span.style), 0) + 1
+    return counts
+
+
+class TrackMapTests(unittest.TestCase):
+    def test_traced_length_matches_hand_computed_geometry(self):
+        track = extract_track_map(square_lap_position_data(), square_lap())
+
+        self.assertAlmostEqual(float(track["length_m"]), 400.0, places=6)
+        self.assertFalse(track["length_is_official"])
+
+    def test_official_length_from_the_table_wins_over_the_traced_estimate(self):
+        track = extract_track_map(
+            square_lap_position_data(), square_lap(), circuit_key=4
+        )
+
+        self.assertEqual(float(track["length_m"]), 4381.0)
+        self.assertTrue(track["length_is_official"])
+
+    def test_zero_coordinate_samples_are_dropped(self):
+        position_data = square_lap_position_data()
+        blank = pd.DataFrame({"Time": [pd.Timedelta(seconds=1.5)], "X": [0.0], "Y": [0.0]})
+        noisy = pd.concat([position_data, blank]).sort_values("Time").reset_index(drop=True)
+
+        track = extract_track_map(noisy, square_lap())
+
+        self.assertAlmostEqual(float(track["length_m"]), 400.0, places=6)
+        self.assertEqual(len(track["points"]), len(position_data))
+
+    def test_sector_times_split_the_lap_into_three_groups(self):
+        track = extract_track_map(square_lap_position_data(), square_lap())
+
+        sectors = list(track["sectors"])
+        self.assertEqual(sorted(set(sectors)), [1, 2, 3])
+        self.assertEqual(sectors, sorted(sectors))
+        self.assertEqual(len(sectors), len(track["points"]))
+
+    def test_missing_sector_times_leave_the_whole_lap_in_one_sector(self):
+        lap = square_lap()
+        lap["Sector1SessionTime"] = pd.NaT
+        lap["Sector2SessionTime"] = pd.NaT
+
+        track = extract_track_map(square_lap_position_data(), lap)
+
+        self.assertEqual(set(track["sectors"]), {1})
+
+    def test_rotation_turns_the_track_to_the_official_orientation(self):
+        straight = pd.DataFrame(
+            {
+                "Time": [pd.Timedelta(seconds=0), pd.Timedelta(seconds=1)],
+                "X": [0.0, 1000.0],
+                "Y": [0.0, 0.0],
+            }
+        )
+        lap = pd.Series(
+            {
+                "LapStartTime": pd.Timedelta(seconds=0),
+                "LapTime": pd.Timedelta(seconds=1),
+                "Sector1SessionTime": pd.NaT,
+                "Sector2SessionTime": pd.NaT,
+            }
+        )
+
+        track = extract_track_map(straight, lap, rotation=90.0)
+
+        end_x, end_y = track["points"][-1]
+        self.assertAlmostEqual(end_x, 0.0, places=6)
+        self.assertAlmostEqual(end_y, 100.0, places=6)
+
+    def test_samples_outside_the_lap_window_are_ignored(self):
+        position_data = square_lap_position_data()
+        stray = pd.DataFrame(
+            {"Time": [pd.Timedelta(seconds=500)], "X": [90000.0], "Y": [90000.0]}
+        )
+        noisy = pd.concat([position_data, stray]).reset_index(drop=True)
+
+        track = extract_track_map(noisy, square_lap())
+
+        self.assertEqual(len(track["points"]), len(position_data))
+        self.assertAlmostEqual(float(track["length_m"]), 400.0, places=6)
+
+    def test_a_lap_without_usable_samples_yields_no_points(self):
+        blank = pd.DataFrame(
+            {
+                "Time": [pd.Timedelta(seconds=0), pd.Timedelta(seconds=1)],
+                "X": [0.0, 0.0],
+                "Y": [0.0, 0.0],
+            }
+        )
+
+        track = extract_track_map(blank, square_lap())
+
+        self.assertEqual(list(track["points"]), [])
+        self.assertEqual(float(track["length_m"]), 0.0)
+
+    def test_the_circuit_description_is_carried_through(self):
+        track = extract_track_map(
+            square_lap_position_data(),
+            square_lap(),
+            corner_count=16,
+            name="Hungaroring",
+            location="Budapest, Hungary",
+        )
+
+        self.assertEqual(track["name"], "Hungaroring")
+        self.assertEqual(track["location"], "Budapest, Hungary")
+        self.assertEqual(track["corner_count"], 16)
+
+
+class GeometryLapTests(unittest.TestCase):
+    def laps_for(self, *driver_numbers):
+        return pd.DataFrame(
+            {
+                "DriverNumber": list(driver_numbers),
+                "LapTime": pd.to_timedelta([80.0] * len(driver_numbers), unit="s"),
+                "LapStartTime": pd.to_timedelta([0.0] * len(driver_numbers), unit="s"),
+                "Sector1SessionTime": pd.to_timedelta([26.0] * len(driver_numbers), unit="s"),
+                "Sector2SessionTime": pd.to_timedelta([53.0] * len(driver_numbers), unit="s"),
+            }
+        )
+
+    def samples_with(self, distinct_positions):
+        # A feed that repeats the same coordinate is what a race looks like for
+        # most cars; the repeats are padded out to a constant sample count so the
+        # choice cannot be explained by raw sample volume.
+        rows = []
+        for index in range(60):
+            step = index % distinct_positions
+            rows.append((pd.Timedelta(seconds=index), 1000.0 + step, 2000.0 + step))
+        return pd.DataFrame(rows, columns=["Time", "X", "Y"])
+
+    def test_the_densest_trace_wins_over_the_fastest_lap(self):
+        laps = self.laps_for("1", "77")
+        position_data = {"1": self.samples_with(3), "77": self.samples_with(40)}
+
+        lap, samples = pick_geometry_lap(laps, position_data)
+
+        self.assertEqual(lap["DriverNumber"], "77")
+        self.assertIs(samples, position_data["77"])
+
+    def test_a_driver_without_position_data_is_skipped(self):
+        laps = self.laps_for("1", "77")
+        position_data = {"77": self.samples_with(5)}
+
+        lap, _ = pick_geometry_lap(laps, position_data)
+
+        self.assertEqual(lap["DriverNumber"], "77")
+
+    def test_no_usable_trace_yields_nothing(self):
+        lap, samples = pick_geometry_lap(self.laps_for("1"), {})
+
+        self.assertIsNone(lap)
+        self.assertIsNone(samples)
+
+
+class TrackPanelTests(unittest.TestCase):
+    def square_track(self, **overrides):
+        track = extract_track_map(
+            square_lap_position_data(),
+            square_lap(),
+            corner_count=16,
+            name="Hungaroring",
+            location="Budapest, Hungary",
+        )
+        track.update(overrides)
+        return track
+
+    def test_a_square_track_is_drawn_square(self):
+        panel = render_track_panel(self.square_track(), TRACK_CONTENT_WIDTH, TRACK_CONTENT_HEIGHT)
+
+        cells = marker_cells(panel)
+        columns = [column for _, column in cells]
+        rows = [row for row, _ in cells]
+        width = max(columns) - min(columns) + 1
+        height = max(rows) - min(rows) + 1
+
+        # A character cell is about twice as tall as it is wide, so a square
+        # track has to come out about twice as wide as it is tall.
+        self.assertAlmostEqual(width, height * 2, delta=2)
+
+    def test_drawn_points_stay_inside_the_map_region(self):
+        panel = render_track_panel(self.square_track(), TRACK_CONTENT_WIDTH, TRACK_CONTENT_HEIGHT)
+
+        cells = marker_cells(panel)
+        self.assertTrue(cells)
+        self.assertLess(max(column for _, column in cells), TRACK_CONTENT_WIDTH - TRACK_TEXT_WIDTH - TRACK_GUTTER)
+        self.assertLess(max(row for row, _ in cells), TRACK_CONTENT_HEIGHT)
+
+    def test_a_wide_track_keeps_clear_of_the_text_column(self):
+        # A circuit far wider than it is tall fills the map region edge to edge,
+        # which is when it would otherwise run into the description.
+        wide = self.square_track(
+            points=[(x / 2.0, 0.0) for x in range(200)],
+            sectors=[1] * 200,
+        )
+
+        panel = render_track_panel(wide, TRACK_CONTENT_WIDTH, TRACK_CONTENT_HEIGHT)
+
+        for line in panel.plain.split("\n"):
+            gutter = line[TRACK_CONTENT_WIDTH - TRACK_TEXT_WIDTH - TRACK_GUTTER : TRACK_CONTENT_WIDTH - TRACK_TEXT_WIDTH]
+            self.assertEqual(gutter.strip(), "")
+
+    def test_a_long_circuit_name_is_truncated_rather_than_wrapped(self):
+        track = self.square_track(
+            name="Autodromo Internazionale Enzo e Dino Ferrari",
+            location="Spa-Francorchamps, Belgium",
+        )
+
+        panel = render_track_panel(track, TRACK_CONTENT_WIDTH, TRACK_CONTENT_HEIGHT)
+
+        lines = panel.plain.split("\n")
+        self.assertEqual(len(lines), TRACK_CONTENT_HEIGHT)
+        for line in lines:
+            self.assertLessEqual(len(line), TRACK_CONTENT_WIDTH)
+
+    def test_each_sector_is_drawn_in_its_own_colour(self):
+        panel = render_track_panel(self.square_track(), TRACK_CONTENT_WIDTH, TRACK_CONTENT_HEIGHT)
+
+        # The legend contributes exactly one span per colour, so anything above
+        # one is the map itself being coloured.
+        counts = span_style_counts(panel)
+        for colour in ("red", "cyan", "yellow"):
+            self.assertGreater(counts.get(colour, 0), 1)
+
+    def test_the_legend_names_all_three_sectors(self):
+        panel = render_track_panel(self.square_track(), TRACK_CONTENT_WIDTH, TRACK_CONTENT_HEIGHT)
+
+        for sector in ("Sector 1", "Sector 2", "Sector 3"):
+            self.assertIn(sector, panel.plain)
+
+    def test_an_official_length_is_shown_plainly(self):
+        track = self.square_track(length_m=4381.0, length_is_official=True)
+
+        panel = render_track_panel(track, TRACK_CONTENT_WIDTH, TRACK_CONTENT_HEIGHT)
+
+        self.assertIn("4381 m", panel.plain)
+        self.assertNotIn("≈", panel.plain)
+
+    def test_an_estimated_length_is_marked_approximate(self):
+        track = self.square_track(length_m=3272.0, length_is_official=False)
+
+        panel = render_track_panel(track, TRACK_CONTENT_WIDTH, TRACK_CONTENT_HEIGHT)
+
+        self.assertIn("≈ 3272 m", panel.plain)
+
+    def test_the_circuit_name_location_and_corner_count_are_shown(self):
+        panel = render_track_panel(self.square_track(), TRACK_CONTENT_WIDTH, TRACK_CONTENT_HEIGHT)
+
+        self.assertIn("Hungaroring", panel.plain)
+        self.assertIn("Budapest", panel.plain)
+        self.assertIn("16", panel.plain)
+
+    def test_a_single_point_track_does_not_raise(self):
+        track = self.square_track(points=[(10.0, 20.0)], sectors=[1])
+
+        panel = render_track_panel(track, TRACK_CONTENT_WIDTH, TRACK_CONTENT_HEIGHT)
+
+        self.assertEqual(len(marker_cells(panel)), 1)
+
+    def test_identical_points_do_not_raise(self):
+        track = self.square_track(points=[(5.0, 5.0)] * 20, sectors=[1] * 20)
+
+        panel = render_track_panel(track, TRACK_CONTENT_WIDTH, TRACK_CONTENT_HEIGHT)
+
+        self.assertEqual(len(marker_cells(panel)), 1)
+
+    def test_a_track_without_points_still_renders_its_description(self):
+        track = self.square_track(points=[], sectors=[])
+
+        panel = render_track_panel(track, TRACK_CONTENT_WIDTH, TRACK_CONTENT_HEIGHT)
+
+        self.assertEqual(marker_cells(panel), [])
+        self.assertIn("Hungaroring", panel.plain)
+
+    def test_the_panel_fills_the_requested_height(self):
+        panel = render_track_panel(self.square_track(), TRACK_CONTENT_WIDTH, TRACK_CONTENT_HEIGHT)
+
+        self.assertEqual(len(panel.plain.split("\n")), TRACK_CONTENT_HEIGHT)
+
+    def test_the_track_error_says_it_retries_by_itself(self):
+        message = format_track_error(ValueError("no completed lap to draw the circuit from"))
+
+        self.assertIn("no completed lap to draw the circuit from", message)
+        self.assertIn("next session", message)
+
+    def test_a_circuit_named_after_its_town_does_not_repeat_the_town(self):
+        event = {"Location": "Spa-Francorchamps", "Country": "Belgium"}
+
+        self.assertEqual(format_circuit_location(event, "Spa-Francorchamps"), "Belgium")
+
+    def test_a_circuit_in_a_differently_named_town_names_both(self):
+        event = {"Location": "Budapest", "Country": "Hungary"}
+
+        self.assertEqual(format_circuit_location(event, "Hungaroring"), "Budapest, Hungary")
 
 
 if __name__ == "__main__":
