@@ -1,6 +1,6 @@
 [project]
 name = "fast-f1-app"
-version = "0.1.0"
+version = "0.2.0"
 description = "Textual app for browsing current-season Formula 1 results with FastF1"
 readme = "README.md"
 requires-python = ">=3.12"
