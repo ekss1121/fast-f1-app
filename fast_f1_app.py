@@ -9,6 +9,8 @@ from datetime import date
 import fastf1
 import pandas as pd
 import plotext as plt
+# Private on purpose: see load_track_map for why the public telemetry API is unusable.
+from fastf1 import _api as fastf1_api
 from fastf1.plotting import get_team_color
 from rich.text import Text
 from textual.app import App, ComposeResult
@@ -57,6 +59,55 @@ COMPARE_FALLBACK_COLORS = ("cyan", "magenta")
 # TrackStatus flags for safety car, safety car ending, red flag and virtual safety car.
 # Laps run under any of them say nothing about the driver's pace, so the graphs drop them.
 EXCLUDED_TRACK_STATUS = "4567"
+
+# The panel's text is rendered at a fixed size, so these must stay in step with
+# the #track rule in the app's CSS: the content is the styled width and height
+# less the one-cell border on each side.
+TRACK_CONTENT_WIDTH = 60
+TRACK_CONTENT_HEIGHT = 12
+TRACK_TEXT_WIDTH = 22
+# Blank columns between the map and the text, so a wide circuit like Monaco
+# cannot run its last corner into the first letter of the description.
+TRACK_GUTTER = 2
+TRACK_MARKER = "•"
+LEGEND_MARKER = "■"
+SECTOR_COLORS = {1: "red", 2: "cyan", 3: "yellow"}
+# The position API reports coordinates in tenths of a metre.
+POSITION_UNITS_PER_METRE = 10.0
+# A terminal character cell is about twice as tall as it is wide. Every projection
+# has to divide the vertical span by this or the circuit comes out squashed.
+CHARACTER_ASPECT = 2.0
+# Published circuit lengths in metres, keyed by the F1 API's circuit key.
+# Measuring the trace instead is systematically short — a polyline cuts corners,
+# and the error reaches 2% at Monaco — so the published figure wins where we have
+# it. Circuits absent here (a brand-new venue) fall back to the traced estimate,
+# which is labelled as approximate.
+OFFICIAL_CIRCUIT_LENGTHS = {
+    2: 5891,  # Silverstone
+    4: 4381,  # Hungaroring
+    6: 4909,  # Imola
+    7: 7004,  # Spa-Francorchamps
+    9: 5513,  # Circuit of the Americas
+    10: 5278,  # Albert Park
+    14: 4309,  # Interlagos
+    15: 4657,  # Barcelona-Catalunya
+    19: 4318,  # Red Bull Ring
+    22: 3337,  # Monte Carlo
+    23: 4361,  # Gilles Villeneuve
+    39: 5793,  # Monza
+    46: 5807,  # Suzuka
+    49: 5451,  # Shanghai
+    55: 4259,  # Zandvoort
+    61: 4940,  # Marina Bay
+    63: 5412,  # Sakhir
+    65: 4304,  # Hermanos Rodriguez
+    70: 5281,  # Yas Marina
+    144: 6003,  # Baku
+    149: 6174,  # Jeddah
+    150: 5419,  # Lusail
+    151: 5412,  # Miami
+    152: 6201,  # Las Vegas
+}
 
 
 class TextualLogHandler(logging.Handler):
@@ -375,13 +426,30 @@ class F1ResultsApp(App):
         margin-top: 1;
     }
 
+    #bottom {
+        height: 14;
+    }
+
+    /* Width and height here must match TRACK_CONTENT_WIDTH / TRACK_CONTENT_HEIGHT
+       plus the border, since the panel's text is rendered to a fixed size. */
+    #track {
+        width: 62;
+        height: 1fr;
+        border: solid magenta;
+    }
+
+    #log_area {
+        width: 1fr;
+        height: 1fr;
+    }
+
     #log_title {
         height: 1;
         padding: 0 1;
     }
 
     #logs {
-        height: 12;
+        height: 1fr;
         border: solid blue;
     }
     """
@@ -400,8 +468,11 @@ class F1ResultsApp(App):
             yield Select([], prompt="Loading events...", allow_blank=True, id="event", disabled=True)
         yield Static("Finding the current race weekend...", id="status")
         yield TabbedContent(id="sessions")
-        yield Static("Logs", id="log_title")
-        yield RichLog(id="logs", markup=True, highlight=True)
+        with Horizontal(id="bottom"):
+            yield Static("", id="track")
+            with Vertical(id="log_area"):
+                yield Static("Logs", id="log_title")
+                yield RichLog(id="logs", markup=True, highlight=True)
         yield Footer()
 
     @property
@@ -421,6 +492,12 @@ class F1ResultsApp(App):
         self.schedule = None
         self.tabs_ready = False
         self.loaded_event_name: str | None = None
+        # The circuit belongs to the weekend, not to a session, so it is held here
+        # rather than on the views and fetched once per event.
+        self.track: dict[str, object] | None = None
+        self.track_event_name: str | None = None
+        self.track_loading = False
+        self.query_one("#track", Static).border_title = "Track"
 
         self.log_handler = TextualLogHandler(self)
         self.log_handler.setFormatter(
@@ -499,6 +576,13 @@ class F1ResultsApp(App):
         sessions = list(plan["sessions"])
         self.loaded_event_name = event_name
 
+        # A new weekend means a new circuit; drop the old one so it cannot be
+        # shown against the wrong event while the new one loads.
+        self.track = None
+        self.track_event_name = event_name
+        self.track_loading = False
+        self.show_track_message("Loading track...")
+
         self.tabs_ready = False
         await tabs.clear_panes()
         for session in sessions:
@@ -547,6 +631,43 @@ class F1ResultsApp(App):
         view.loaded = True
         view.show_results(rows)
         status.update(f"Loaded {len(rows)} result rows for {view.session_name}.")
+        self.ensure_track_loaded(view)
+
+    def ensure_track_loaded(self, view: SessionResultsView) -> None:
+        """Fetch the circuit once per weekend, off a session that has already loaded.
+
+        Driven from a successful session load rather than from startup, because the
+        geometry is taken from a real lap: a Friday morning with no completed laps
+        has nothing to draw, and the next session to load retries on its own.
+        """
+        if self.track is not None or self.track_loading:
+            return
+
+        self.track_loading = True
+        self.run_worker(self.load_track(view.year, view.event_name, view.session_type))
+
+    async def load_track(self, year: int, event_name: str, session_type: str) -> None:
+        try:
+            track = await asyncio.to_thread(load_track_map, year, event_name, session_type)
+        except Exception as exc:
+            # Left unloaded on purpose: the next session to load tries again.
+            self.track_loading = False
+            if event_name == self.track_event_name:
+                self.show_track_message(format_track_error(exc))
+            return
+
+        self.track_loading = False
+        if event_name != self.track_event_name:
+            # The weekend changed while this was in flight.
+            return
+
+        self.track = track
+        self.query_one("#track", Static).update(
+            render_track_panel(track, TRACK_CONTENT_WIDTH, TRACK_CONTENT_HEIGHT)
+        )
+
+    def show_track_message(self, message: str) -> None:
+        self.query_one("#track", Static).update(Text(message, style="dim"))
 
     async def on_tabbed_content_tab_activated(self, event: TabbedContent.TabActivated) -> None:
         if not self.tabs_ready:
@@ -1343,6 +1464,284 @@ def load_best_lap_results(session: fastf1.core.Session) -> list[dict[str, object
             }
         )
     return rows
+
+
+def official_circuit_length(circuit_key: object) -> float | None:
+    """The published length of a circuit, or None if we don't have it on file."""
+    if circuit_key is None:
+        return None
+    try:
+        key = int(circuit_key)
+    except (TypeError, ValueError):
+        return None
+    length = OFFICIAL_CIRCUIT_LENGTHS.get(key)
+    return float(length) if length is not None else None
+
+
+def select_lap_position_samples(position_data: "pd.DataFrame", lap: object) -> "pd.DataFrame":
+    """One lap's position samples, with the API's no-fix placeholders removed."""
+    samples = position_data
+    start = lap.get("LapStartTime")
+    lap_time = lap.get("LapTime")
+    if start is not None and start == start and lap_time is not None and lap_time == lap_time:
+        samples = samples[(samples["Time"] >= start) & (samples["Time"] <= start + lap_time)]
+    # (0, 0) is what the position API sends when it has no fix for the car. Those
+    # samples are not on the track, and keeping them drags the map toward the origin.
+    return samples[(samples["X"] != 0) | (samples["Y"] != 0)]
+
+
+def rotate_points(points: list[tuple[float, float]], degrees: float) -> list[tuple[float, float]]:
+    """Turn the coordinate system to match the orientation of the official circuit map."""
+    angle = math.radians(degrees)
+    cos = math.cos(angle)
+    sin = math.sin(angle)
+    return [(x * cos - y * sin, x * sin + y * cos) for x, y in points]
+
+
+def assign_sectors(times: list[object], lap: object) -> list[int]:
+    """Label each sample with the official sector it was recorded in.
+
+    Split on time rather than on distance: the position-only path carries no
+    Distance column, and the sector session times say exactly when the driver
+    crossed each line. A lap missing them stays in one sector rather than failing.
+    """
+    first = lap.get("Sector1SessionTime")
+    second = lap.get("Sector2SessionTime")
+    if first is None or first != first or second is None or second != second:
+        return [1] * len(times)
+    return [1 if time < first else (2 if time < second else 3) for time in times]
+
+
+def polyline_length(points: list[tuple[float, float]]) -> float:
+    return sum(math.dist(start, end) for start, end in zip(points, points[1:]))
+
+
+def pick_geometry_lap(laps: "pd.DataFrame", position_data: dict) -> tuple[object, object]:
+    """The lap whose position trace covers the circuit best, and that driver's samples.
+
+    Deliberately not the fastest lap. In a race the position feed updates any one
+    car far less often than in qualifying: at the 2026 Hungarian Grand Prix the
+    fastest lap carried 26 distinct positions where another car's lap carried 341,
+    which draws the circuit as two dozen scattered dots. The shape of a circuit
+    does not depend on who drove it, so the trace with the most distinct positions
+    wins.
+    """
+    best: tuple[object, object] = (None, None)
+    best_score = 0
+
+    for driver_number, driver_laps in laps.groupby("DriverNumber"):
+        if not driver_laps["LapTime"].notna().any():
+            continue
+        samples = position_data.get(str(driver_number))
+        if samples is None or samples.empty:
+            continue
+
+        lap = driver_laps.loc[driver_laps["LapTime"].idxmin()]
+        selected = select_lap_position_samples(samples, lap)
+        score = len(set(zip(selected["X"], selected["Y"])))
+        if score > best_score:
+            best = (lap, samples)
+            best_score = score
+
+    return best
+
+
+def extract_track_map(
+    position_data: "pd.DataFrame",
+    lap: object,
+    *,
+    rotation: float = 0.0,
+    corner_count: int = 0,
+    circuit_key: object = None,
+    name: str = "",
+    location: str = "",
+) -> dict[str, object]:
+    """Reduce one lap's position data to a plain description of the circuit.
+
+    Everything FastF1-shaped stops here: the result is points, sectors and text,
+    so the renderer never has to know where any of it came from.
+    """
+    samples = select_lap_position_samples(position_data, lap)
+    points = rotate_points(
+        [
+            (float(x) / POSITION_UNITS_PER_METRE, float(y) / POSITION_UNITS_PER_METRE)
+            for x, y in zip(samples["X"], samples["Y"])
+        ],
+        rotation,
+    )
+    sectors = assign_sectors(list(samples["Time"]), lap)
+    official = official_circuit_length(circuit_key)
+
+    return {
+        "name": name,
+        "location": location,
+        "corner_count": int(corner_count),
+        "points": points,
+        "sectors": sectors,
+        "length_m": float(official if official is not None else polyline_length(points)),
+        "length_is_official": official is not None,
+    }
+
+
+def project_track(
+    points: list[tuple[float, float]], sectors: list[int], width: int, height: int
+) -> list[Text]:
+    """Draw the lap into a character grid, keeping the circuit's real proportions.
+
+    Both axes take the same scale — that is what makes the drawn shape the
+    circuit's own shape — but the vertical span is converted into character-cell
+    units first, because a cell is about twice as tall as it is wide. Without that
+    conversion the track comes out squashed to half its true height.
+
+    The track therefore rarely fills the grid: an equal-aspect square circuit in a
+    38x12 box occupies about 24 columns. That whitespace is the price of an honest
+    shape, not a bug to be fixed by stretching.
+    """
+    cells: list[list[int | None]] = [[None] * width for _ in range(height)]
+
+    if points:
+        xs = [x for x, _ in points]
+        ys = [y for _, y in points]
+        left, bottom = min(xs), min(ys)
+        span_x = max(xs) - left
+        span_y = max(ys) - bottom
+        if span_x <= 0 and span_y <= 0:
+            # Every sample in the same place; a scale of zero puts the one
+            # marker in the middle instead of dividing by nothing.
+            scale = 0.0
+        else:
+            scale = min(
+                (width - 1) / span_x if span_x > 0 else math.inf,
+                (height - 1) / (span_y / CHARACTER_ASPECT) if span_y > 0 else math.inf,
+            )
+        offset_x = (width - 1 - span_x * scale) / 2
+        offset_y = (height - 1 - span_y * scale / CHARACTER_ASPECT) / 2
+
+        for (x, y), sector in zip(points, sectors):
+            column = int(round((x - left) * scale + offset_x))
+            row = int(round((height - 1) - ((y - bottom) * scale / CHARACTER_ASPECT + offset_y)))
+            if 0 <= row < height and 0 <= column < width:
+                cells[row][column] = sector
+
+    lines: list[Text] = []
+    for row_cells in cells:
+        line = Text()
+        for sector in row_cells:
+            if sector is None:
+                line.append(" ")
+            else:
+                line.append(TRACK_MARKER, style=SECTOR_COLORS.get(sector, ""))
+        lines.append(line)
+    return lines
+
+
+def format_track_length(track: dict[str, object]) -> str:
+    """Say the length, and say plainly when it is only a measurement of the trace."""
+    length = float(track.get("length_m", 0.0) or 0.0)
+    if length <= 0:
+        return "Length   unknown"
+    if track.get("length_is_official"):
+        return f"Length   {length:.0f} m"
+    return f"Length   ≈ {length:.0f} m"
+
+
+def describe_track(track: dict[str, object], height: int) -> list[Text]:
+    """The text column: what circuit this is, how long, and what the colours mean."""
+    lines: list[Text] = []
+    name = str(track.get("name", ""))
+    location = str(track.get("location", ""))
+    if name:
+        lines.append(Text(name, style="bold"))
+    if location:
+        lines.append(Text(location, style="dim"))
+    lines.append(Text(""))
+    lines.append(Text(format_track_length(track)))
+    corner_count = int(track.get("corner_count", 0) or 0)
+    if corner_count:
+        lines.append(Text(f"Corners  {corner_count}"))
+    lines.append(Text(""))
+    for sector in (1, 2, 3):
+        entry = Text(LEGEND_MARKER + " ", style=SECTOR_COLORS[sector])
+        entry.append(f"Sector {sector}")
+        lines.append(entry)
+
+    # Hard truncate: a long circuit name that wraps would push every following
+    # row down and tear the map away from its own description.
+    for line in lines:
+        line.truncate(TRACK_TEXT_WIDTH, overflow="ellipsis")
+
+    lines = lines[:height]
+    lines.extend(Text("") for _ in range(height - len(lines)))
+    return lines
+
+
+def render_track_panel(track: dict[str, object], width: int, height: int) -> Text:
+    """The whole panel: the circuit on the left, what it is on the right."""
+    map_width = max(width - TRACK_TEXT_WIDTH - TRACK_GUTTER, 1)
+    map_lines = project_track(
+        list(track.get("points", [])), list(track.get("sectors", [])), map_width, height
+    )
+    text_lines = describe_track(track, height)
+
+    panel = Text()
+    for index, (map_line, text_line) in enumerate(zip(map_lines, text_lines)):
+        panel.append_text(map_line)
+        panel.append(" " * TRACK_GUTTER)
+        panel.append_text(text_line)
+        if index < height - 1:
+            panel.append("\n")
+    return panel
+
+
+def format_track_error(exc: Exception) -> str:
+    """Say why there is no circuit yet, and that it is not the user's move."""
+    return f"No track map yet: {exc}.\nIt will load with the next session."
+
+
+def format_circuit_location(event: object, name: str = "") -> str:
+    """Where the circuit is, without repeating what it is already called.
+
+    Several circuits share their name with their town — Spa-Francorchamps and
+    Monte Carlo among them — and printing both reads as a stutter.
+    """
+    location = str(event.get("Location", "") or "")
+    country = str(event.get("Country", "") or "")
+    parts = [location, country] if location and location != name else [country]
+    return ", ".join(part for part in parts if part)
+
+
+def load_track_map(year: int, event_name: str, session_type: str) -> dict[str, object]:
+    """Fetch one weekend's circuit geometry from a session that has run.
+
+    Deliberately avoids ``Session.get_telemetry()``. For the 2026 season FastF1's
+    car-data parser raises on every session, and because car data is loaded first
+    that failure aborts the whole telemetry load and takes the position data with
+    it. The position data itself is perfectly good, so it is read straight from
+    the API layer instead — that is the only reason this panel works this season.
+    """
+    session = fastf1.get_session(year, event_name, session_type)
+    session.load(telemetry=False, weather=False, messages=False)
+
+    if session.laps.empty or not session.laps["LapTime"].notna().any():
+        raise ValueError("no completed lap to draw the circuit from")
+
+    position_data = fastf1_api.position_data(session.api_path)
+    lap, samples = pick_geometry_lap(session.laps, position_data)
+    if lap is None or samples is None:
+        raise ValueError("no position data for any completed lap")
+
+    circuit_info = session.get_circuit_info()
+    circuit = ((session.session_info or {}).get("Meeting", {}) or {}).get("Circuit", {}) or {}
+    name = str(circuit.get("ShortName", "") or event_name)
+    return extract_track_map(
+        samples,
+        lap,
+        rotation=float(getattr(circuit_info, "rotation", 0.0) or 0.0),
+        corner_count=len(circuit_info.corners) if circuit_info is not None else 0,
+        circuit_key=circuit.get("Key"),
+        name=name,
+        location=format_circuit_location(session.event, name),
+    )
 
 
 def main() -> None:
