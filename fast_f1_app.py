@@ -54,6 +54,9 @@ COMPOUND_STYLES = {
 }
 COMPARE_SLOTS = ("A", "B")
 COMPARE_FALLBACK_COLORS = ("cyan", "magenta")
+# TrackStatus flags for safety car, safety car ending, red flag and virtual safety car.
+# Laps run under any of them say nothing about the driver's pace, so the graphs drop them.
+EXCLUDED_TRACK_STATUS = "4567"
 
 
 class TextualLogHandler(logging.Handler):
@@ -254,6 +257,7 @@ class SessionResultsView(Horizontal):
                 [
                     {
                         "label": str(row["abbreviation"]),
+                        "lap_numbers": detail["lap_numbers"],
                         "lap_times": detail["lap_times"],
                         "color": color,
                     }
@@ -888,7 +892,17 @@ def make_y_ticks(minimum: float, maximum: float, target_count: int = 10) -> list
     return [round(start + index * step, decimals) for index in range(count)]
 
 
-def make_lap_time_graph(lap_times: list[float]) -> str:
+def make_lap_ticks(lap_numbers: list[int]) -> list[int]:
+    """Four-ish evenly spaced x ticks that always include the first and last lap."""
+    first, last = lap_numbers[0], lap_numbers[-1]
+    step = max(1, (last - first) // 4)
+    ticks = list(range(first, last + 1, step))
+    if ticks[-1] != last:
+        ticks.append(last)
+    return ticks
+
+
+def make_lap_time_graph(lap_numbers: list[int], lap_times: list[float]) -> str:
     if not lap_times:
         return "No lap times available."
 
@@ -897,21 +911,38 @@ def make_lap_time_graph(lap_times: list[float]) -> str:
 
     plt.plotsize(58, max(14, min(26, len(y_ticks) * 2)))
     plt.theme("clear")
-    plt.title("Lap times")
+    plt.title("Lap times (clean laps)")
     plt.xlabel("Lap")
     plt.ylabel("Seconds")
     plt.ylim(y_ticks[0], y_ticks[-1])
     plt.yticks(y_ticks)
-    lap_numbers = list(range(1, len(lap_times) + 1))
-    tick_step = max(1, len(lap_numbers) // 4)
-    ticks = list(range(1, len(lap_numbers) + 1, tick_step))
-    if ticks[-1] != len(lap_numbers):
-        ticks.append(len(lap_numbers))
-    plt.xticks(ticks)
+    plt.xticks(make_lap_ticks(lap_numbers))
+    # scatter, not plot: the x axis carries real lap numbers, so filtered-out laps leave
+    # gaps that a line would silently bridge with a trend that was never driven.
     plt.scatter(lap_numbers, lap_times, marker="dot")
     graph = plt.uncolorize(plt.build())
     plt.clear_figure()
     return graph
+
+
+def format_clean_lap_note(lap_count: int, clean_count: int) -> Text:
+    """Say how many laps the graph and the timing stats are actually built from.
+
+    Fastest/Slowest/Average all come from the clean laps, but Laps stays the real
+    number of laps completed, so the difference has to be spelled out rather than
+    left for the reader to notice.
+    """
+    excluded = lap_count - clean_count
+    if excluded <= 0:
+        return Text("Timings from all " + str(clean_count) + " laps.", style="dim")
+    return Text(
+        "Timings and graph from "
+        + str(clean_count)
+        + " clean laps; "
+        + str(excluded)
+        + " excluded (pit in/out, safety car, red flag).",
+        style="dim",
+    )
 
 
 def render_driver_details(row: dict[str, object], details: dict[str, object]) -> Text:
@@ -935,8 +966,10 @@ def render_driver_details(row: dict[str, object], details: dict[str, object]) ->
     text.append("Stops: " + str(details["stops"]) + " | Tire compounds used: " + str(len(compounds)) + " (")
     text.append_text(format_compounds(compounds))
     text.append(")\n")
-    text.append("Lap time graph:\n" + make_lap_time_graph(lap_times) + "\n")
+    text.append("Lap time graph:\n" + make_lap_time_graph(details["lap_numbers"], lap_times) + "\n")
     text.append("Laps: " + str(details["lap_count"]) + " | Fastest: " + fastest + " | Slowest: " + slowest)
+    text.append("\n")
+    text.append_text(format_clean_lap_note(int(details["lap_count"]), len(lap_times)))
     return text
 
 
@@ -959,38 +992,68 @@ def resolve_comparison_colors(first: str, second: str) -> tuple[str, str]:
     return str(first), str(second)
 
 
-def make_comparison_lap_time_graph(series: list[dict[str, object]]) -> Text:
-    plotted = [entry for entry in series if entry["lap_times"]]
-    if not plotted:
-        return Text("No lap times available.")
+def build_lap_deltas(
+    first: dict[str, object], second: dict[str, object]
+) -> list[tuple[int, float]]:
+    """Per-lap ``second - first`` on the laps both drivers ran cleanly, in lap order.
 
-    all_times = [lap_time for entry in plotted for lap_time in entry["lap_times"]]
-    longest = max(len(entry["lap_times"]) for entry in plotted)
+    Laps only one of them has — a lap where just one pitted, or ran behind the safety
+    car — have no meaningful delta, so they are left out entirely rather than compared
+    against a neighbouring lap.
+    """
+    first_by_lap = dict(zip(first["lap_numbers"], first["lap_times"]))
+    second_by_lap = dict(zip(second["lap_numbers"], second["lap_times"]))
+    shared = sorted(set(first_by_lap) & set(second_by_lap))
+    return [(lap, second_by_lap[lap] - first_by_lap[lap]) for lap in shared]
+
+
+def make_comparison_lap_time_graph(series: list[dict[str, object]]) -> Text:
+    """Per-lap delta between two drivers, coloured by who was quicker on that lap.
+
+    Overlaying both drivers' absolute lap times does not work in a terminal: they are
+    usually within a second or two of each other while the y axis has to span several,
+    so the two series land on the same rows. Plotting the difference gives the whole
+    axis to the quantity being compared.
+    """
+    if len(series) < 2:
+        return Text("Two drivers are needed for a comparison.")
+
+    first, second = series[0], series[1]
+    deltas = build_lap_deltas(first, second)
+    if not deltas:
+        return Text("No laps in common to compare.")
+
+    lap_numbers = [lap for lap, _ in deltas]
+    values = [delta for _, delta in deltas]
 
     plt.clear_figure()
-    y_ticks = make_y_ticks(min(all_times), max(all_times))
+    y_ticks = make_y_ticks(min(values), max(values))
     plt.plotsize(58, max(14, min(26, len(y_ticks) * 2)))
     plt.theme("clear")
-    plt.title("Lap times")
+    plt.title(f"Lap delta: {second['label']} minus {first['label']}")
     plt.xlabel("Lap")
     plt.ylabel("Seconds")
     plt.ylim(y_ticks[0], y_ticks[-1])
     plt.yticks(y_ticks)
+    plt.xticks(make_lap_ticks(lap_numbers))
+    plt.hline(0)
 
-    tick_step = max(1, longest // 4)
-    ticks = list(range(1, longest + 1, tick_step))
-    if ticks[-1] != longest:
-        ticks.append(longest)
-    plt.xticks(ticks)
-
-    for entry in plotted:
-        lap_times = entry["lap_times"]
+    # Split by sign so each point carries the colour of whoever was quicker that lap.
+    # The delta is second minus first, so a negative delta is a lap second won.
+    for entry, keep_negative in ((second, True), (first, False)):
+        points = [
+            (lap, delta)
+            for lap, delta in deltas
+            if (delta < 0) == keep_negative and delta != 0
+        ]
+        if not points:
+            continue
         plt.scatter(
-            list(range(1, len(lap_times) + 1)),
-            lap_times,
+            [lap for lap, _ in points],
+            [delta for _, delta in points],
             marker="dot",
             color=to_plot_color(str(entry["color"])),
-            label=str(entry["label"]),
+            label=f"{entry['label']} quicker",
         )
 
     graph = plt.build()
@@ -1030,6 +1093,13 @@ def build_comparison_metrics(
             str(first["lap_count"]),
             str(second["lap_count"]),
             f"{int(first['lap_count']) - int(second['lap_count']):+d}",
+        ),
+        # Every timing row below is built from these laps, not from the Laps row above.
+        (
+            "Clean laps",
+            str(len(first_times)),
+            str(len(second_times)),
+            f"{len(first_times) - len(second_times):+d}",
         ),
         compare_time_metric(
             "Fastest",
@@ -1123,20 +1193,42 @@ def build_qualifying_details(laps: object, driver_laps: object) -> dict[str, obj
     }
 
 
+def select_clean_laps(laps: "pd.DataFrame") -> "pd.DataFrame":
+    """Laps that represent pure pace: timed, not in or out of the pits, run at green flag.
+
+    Equivalent to FastF1's ``pick_wo_box().pick_track_status("4567", how="none")`` but
+    written against the columns, so it also works on a plain DataFrame in the tests.
+    A single out-lap is enough to stretch the graph's y axis over 20 seconds and flatten
+    every racing lap onto one row, which is what this exists to prevent.
+    """
+    keep = laps["LapTime"].notna()
+    for column in ("PitInTime", "PitOutTime"):
+        if column in laps:
+            keep &= laps[column].isna()
+    if "TrackStatus" in laps:
+        status = laps["TrackStatus"].fillna("").astype(str)
+        keep &= ~status.apply(lambda value: any(flag in value for flag in EXCLUDED_TRACK_STATUS))
+    return laps[keep]
+
+
 def extract_driver_details(
     session: fastf1.core.Session, session_type: str, driver_number: str
 ) -> dict[str, object]:
     laps = session.laps[session.laps["DriverNumber"].astype(str) == driver_number]
+    clean = select_clean_laps(laps)
 
-    lap_times: list[float] = []
-    for lap_time in laps["LapTime"].dropna().tolist():
-        lap_times.append(float(lap_time.total_seconds()))
+    lap_times = [float(lap_time.total_seconds()) for lap_time in clean["LapTime"]]
+    if "LapNumber" in clean:
+        lap_numbers = [int(number) for number in clean["LapNumber"]]
+    else:
+        lap_numbers = list(range(1, len(lap_times) + 1))
 
     compounds = [str(compound) for compound in laps["Compound"].dropna().unique().tolist()]
     stops = int(laps["PitInTime"].notna().sum()) if "PitInTime" in laps else 0
 
     details: dict[str, object] = {
         "lap_count": int(len(laps)),
+        "lap_numbers": lap_numbers,
         "lap_times": lap_times,
         "stops": stops,
         "compounds": compounds,

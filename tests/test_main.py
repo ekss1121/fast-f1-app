@@ -6,6 +6,7 @@ from textual.widgets import Select
 
 from fast_f1_app import (
     build_comparison_metrics,
+    build_lap_deltas,
     build_qualifying_details,
     build_weekend_plan,
     extract_driver_details,
@@ -27,6 +28,7 @@ from fast_f1_app import (
     make_y_ticks,
     render_driver_details,
     resolve_comparison_colors,
+    select_clean_laps,
     to_plot_color,
     to_position,
 )
@@ -44,7 +46,7 @@ class FormattingTests(unittest.TestCase):
         self.assertEqual(format_qualifying_time(result), "01:24.000000")
 
     def test_make_lap_time_graph_uses_plotext_output(self):
-        graph = make_lap_time_graph([83.4, 82.9, 83.1])
+        graph = make_lap_time_graph([1, 2, 3], [83.4, 82.9, 83.1])
 
         self.assertIn("Lap times", graph)
         self.assertIn("Lap", graph)
@@ -52,9 +54,16 @@ class FormattingTests(unittest.TestCase):
 
     def test_make_lap_time_graph_plots_one_marker_per_lap(self):
         lap_times = [83.4, 92.1, 85.0, 110.6, 84.2]
-        graph = make_lap_time_graph(lap_times)
+        graph = make_lap_time_graph([1, 2, 3, 4, 5], lap_times)
 
         self.assertEqual(graph.count("•"), len(lap_times))
+
+    def test_make_lap_time_graph_labels_the_real_lap_numbers(self):
+        # Laps dropped by the clean-lap filter must not renumber the ones that remain.
+        graph = make_lap_time_graph([12, 13, 14, 40], [83.4, 82.9, 83.1, 82.8])
+
+        self.assertIn("12", graph)
+        self.assertIn("40", graph)
 
 
 class YTickTests(unittest.TestCase):
@@ -97,10 +106,31 @@ class ResultDecorationTests(unittest.TestCase):
     def test_render_driver_details_includes_compound_decoration(self):
         details = render_driver_details(
             {"driver": "Max Verstappen", "driver_number": "1", "team": "Red Bull Racing"},
-            {"stops": 1, "compounds": ["SOFT"], "lap_times": [83.4], "lap_count": 1},
+            {
+                "stops": 1,
+                "compounds": ["SOFT"],
+                "lap_numbers": [1],
+                "lap_times": [83.4],
+                "lap_count": 1,
+            },
         )
 
         self.assertIn("🛞 SOFT", details.plain)
+
+    def test_render_driver_details_says_how_many_laps_were_excluded(self):
+        details = render_driver_details(
+            {"driver": "Max Verstappen", "driver_number": "1", "team": "Red Bull Racing"},
+            {
+                "stops": 1,
+                "compounds": ["SOFT"],
+                "lap_numbers": [1, 2],
+                "lap_times": [83.4, 83.9],
+                "lap_count": 5,
+            },
+        )
+
+        self.assertIn("2 clean laps", details.plain)
+        self.assertIn("3 excluded", details.plain)
 
     def test_build_qualifying_details_compares_driver_best_lap_to_pole(self):
         laps = pd.DataFrame(
@@ -128,6 +158,7 @@ class ResultDecorationTests(unittest.TestCase):
             {
                 "stops": 0,
                 "compounds": ["SOFT"],
+                "lap_numbers": [1],
                 "lap_times": [80.5],
                 "lap_count": 1,
                 "qualifying": {
@@ -144,16 +175,83 @@ class ResultDecorationTests(unittest.TestCase):
         self.assertIn("S1: 0:20.100 (+0.100)", details.plain)
 
 
+class CleanLapTests(unittest.TestCase):
+    def make_laps(self, **overrides):
+        laps = {
+            "LapNumber": [1.0, 2.0, 3.0, 4.0, 5.0],
+            "LapTime": pd.to_timedelta([83.4, 83.9, 102.3, 84.1, 83.7], unit="s"),
+            "PitInTime": pd.to_timedelta([None, None, None, None, None]),
+            "PitOutTime": pd.to_timedelta([None, None, None, None, None]),
+            "TrackStatus": ["1", "1", "1", "1", "1"],
+        }
+        laps.update(overrides)
+        return pd.DataFrame(laps)
+
+    def kept(self, laps):
+        return [int(number) for number in select_clean_laps(laps)["LapNumber"]]
+
+    def test_untimed_laps_are_dropped(self):
+        laps = self.make_laps(
+            LapTime=pd.to_timedelta([83.4, None, 102.3, 84.1, 83.7], unit="s")
+        )
+
+        self.assertEqual(self.kept(laps), [1, 3, 4, 5])
+
+    def test_the_in_lap_and_the_out_lap_are_dropped(self):
+        laps = self.make_laps(
+            PitInTime=pd.to_timedelta([None, 90.0, None, None, None], unit="s"),
+            PitOutTime=pd.to_timedelta([None, None, 91.0, None, None], unit="s"),
+        )
+
+        self.assertEqual(self.kept(laps), [1, 4, 5])
+
+    def test_safety_car_and_red_flag_laps_are_dropped(self):
+        # 4 safety car, 5 safety car ending, 6/7 virtual safety car, 1 green.
+        laps = self.make_laps(TrackStatus=["1", "4", "6", "15", "1"])
+
+        self.assertEqual(self.kept(laps), [1, 5])
+
+    def test_a_green_flag_lap_with_a_multi_digit_status_is_kept(self):
+        laps = self.make_laps(TrackStatus=["1", "12", "1", "1", "1"])
+
+        self.assertEqual(self.kept(laps), [1, 2, 3, 4, 5])
+
+    def test_lap_data_without_the_optional_columns_still_filters_on_lap_time(self):
+        laps = pd.DataFrame(
+            {
+                "LapNumber": [1.0, 2.0],
+                "LapTime": pd.to_timedelta([83.4, None], unit="s"),
+            }
+        )
+
+        self.assertEqual(self.kept(laps), [1])
+
+    def test_extract_driver_details_reports_real_lap_numbers_for_clean_laps(self):
+        laps = self.make_laps(
+            DriverNumber=["44", "44", "44", "44", "44"],
+            Compound=["SOFT", "SOFT", "SOFT", "MEDIUM", "MEDIUM"],
+            TrackStatus=["1", "4", "1", "1", "1"],
+        )
+
+        details = extract_driver_details(LoadedSession(laps), "R", "44")
+
+        self.assertEqual(details["lap_numbers"], [1, 3, 4, 5])
+        self.assertEqual(details["lap_count"], 5)
+        self.assertEqual(len(details["lap_times"]), 4)
+
+
 class ComparisonTests(unittest.TestCase):
     def setUp(self):
         self.first = {
             "lap_count": 58,
+            "lap_numbers": [1, 2, 3],
             "lap_times": [83.4, 84.1, 85.0],
             "stops": 1,
             "compounds": ["MEDIUM", "HARD"],
         }
         self.second = {
             "lap_count": 57,
+            "lap_numbers": [1, 2, 3],
             "lap_times": [83.9, 83.5, 86.2],
             "stops": 2,
             "compounds": ["SOFT"],
@@ -217,37 +315,78 @@ class ComparisonTests(unittest.TestCase):
     def test_qualifying_metrics_are_omitted_for_a_race(self):
         self.assertNotIn("S1", self.metrics_by_name())
 
-    def test_comparison_graph_plots_both_series_in_their_own_color(self):
+    def compare_entry(self, label, detail, color):
+        return {
+            "label": label,
+            "lap_numbers": detail["lap_numbers"],
+            "lap_times": detail["lap_times"],
+            "color": color,
+        }
+
+    def test_lap_deltas_are_second_minus_first_per_lap(self):
+        deltas = build_lap_deltas(self.first, self.second)
+
+        self.assertEqual([lap for lap, _ in deltas], [1, 2, 3])
+        self.assertAlmostEqual(deltas[0][1], 0.5)
+        self.assertAlmostEqual(deltas[1][1], -0.6)
+
+    def test_lap_deltas_only_cover_laps_both_drivers_ran_cleanly(self):
+        # A lap only one of them has -- one pitted, or sat behind the safety car --
+        # has nothing to compare against and must not shift the others along.
+        first = {"lap_numbers": [1, 2, 5], "lap_times": [83.4, 84.1, 85.0]}
+        second = {"lap_numbers": [2, 5, 6], "lap_times": [83.9, 83.5, 86.2]}
+
+        deltas = build_lap_deltas(first, second)
+
+        self.assertEqual([lap for lap, _ in deltas], [2, 5])
+
+    def test_comparison_graph_colors_each_lap_by_whoever_was_quicker(self):
         graph = make_comparison_lap_time_graph(
             [
-                {"label": "RUS", "lap_times": self.first["lap_times"], "color": "#00d2be"},
-                {"label": "NOR", "lap_times": self.second["lap_times"], "color": "#ff8700"},
+                self.compare_entry("RUS", self.first, "#00d2be"),
+                self.compare_entry("NOR", self.second, "#ff8700"),
             ]
         )
         styles = {str(span.style) for span in graph.spans}
 
+        # Laps 1 and 3 went to RUS, lap 2 to NOR, so both colors appear.
         self.assertIn("#00d2be", styles)
         self.assertIn("#ff8700", styles)
-        self.assertIn("RUS", graph.plain)
-        self.assertIn("NOR", graph.plain)
+        self.assertIn("RUS quicker", graph.plain)
+        self.assertIn("NOR quicker", graph.plain)
+
+    def test_comparison_graph_titles_the_direction_of_the_delta(self):
+        graph = make_comparison_lap_time_graph(
+            [
+                self.compare_entry("RUS", self.first, "#00d2be"),
+                self.compare_entry("NOR", self.second, "#ff8700"),
+            ]
+        )
+
+        self.assertIn("NOR minus RUS", graph.plain)
 
     def test_comparison_graph_handles_a_driver_with_no_laps(self):
         graph = make_comparison_lap_time_graph(
             [
-                {"label": "RUS", "lap_times": [83.4, 84.0], "color": "cyan"},
-                {"label": "STR", "lap_times": [], "color": "magenta"},
+                {"label": "RUS", "lap_numbers": [1, 2], "lap_times": [83.4, 84.0], "color": "cyan"},
+                {"label": "STR", "lap_numbers": [], "lap_times": [], "color": "magenta"},
             ]
         )
 
-        self.assertIn("RUS", graph.plain)
-        self.assertNotIn("STR", graph.plain)
+        self.assertEqual(graph.plain, "No laps in common to compare.")
 
-    def test_comparison_graph_without_any_laps_reports_no_data(self):
+    def test_comparison_graph_needs_two_drivers(self):
         graph = make_comparison_lap_time_graph(
-            [{"label": "STR", "lap_times": [], "color": "cyan"}]
+            [{"label": "STR", "lap_numbers": [], "lap_times": [], "color": "cyan"}]
         )
 
-        self.assertEqual(graph.plain, "No lap times available.")
+        self.assertEqual(graph.plain, "Two drivers are needed for a comparison.")
+
+    def test_clean_lap_count_is_reported_next_to_the_real_lap_count(self):
+        metrics = self.metrics_by_name()
+
+        self.assertEqual(metrics["Laps"], ("58", "57", "+1"))
+        self.assertEqual(metrics["Clean laps"], ("3", "3", "+0"))
 
 
 class PositionTests(unittest.TestCase):
