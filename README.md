@@ -19,7 +19,7 @@ This is an unofficial project. It is not associated in any way with Formula 1, t
 - **Per-driver detail.** Select a row for lap-time stats, tire compounds and stops, plus — in qualifying — a sector-by-sector delta to the fastest lap of the session.
 - **Two-driver comparison.** Both drivers' lap times on one graph next to a metrics table with an explicit Δ column.
 - **The circuit itself.** A track panel draws the lap in its real proportions with each official sector in its own colour, alongside the circuit's name, location, length and corner count.
-- **A log pane.** FastF1's own chatter (cache hits, downloads, warnings) is piped into the panel at the bottom instead of scribbling over the UI.
+- **A log pane.** FastF1's own chatter (cache hits, downloads, warnings) is piped into the panel at the bottom right instead of scribbling over the UI.
 
 ## Install
 
@@ -84,7 +84,7 @@ The panel at the bottom left, visible in the screenshot above, draws the weekend
 
 It belongs to the weekend rather than to a session, so it loads once and stays put while you switch tabs. The drawing keeps the circuit's real proportions, which is why a roughly square circuit like the Hungaroring leaves space either side rather than being stretched to fill the panel.
 
-Lengths are the published figures. Where a circuit isn't on file — a brand-new venue, say — the length is measured off the trace instead and shown with a `≈`, since measuring a lap that way runs short by up to about 2%.
+Lengths are the published figures where the circuit is on file. Where it is not — a brand-new venue, say — the length is measured off the trace instead and shown with a `≈`, since measuring a lap that way can be off by up to about 2%.
 
 ## Test
 
