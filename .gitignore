@@ -10,3 +10,5 @@ wheels/
 .venv
 # Pi agent artifacts
 .pi-subagents/
+# Claude Code local settings
+.claude/
