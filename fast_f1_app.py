@@ -426,12 +426,14 @@ class F1ResultsApp(App):
         margin-top: 1;
     }
 
+    /* The track panel's text is rendered to a fixed size, so these two rules and
+       TRACK_CONTENT_WIDTH / TRACK_CONTENT_HEIGHT are one decision spelled in three
+       places: #bottom's height and #track's width each carry the constant plus the
+       one-cell border on each side. Change one, change all three. */
     #bottom {
         height: 14;
     }
 
-    /* Width and height here must match TRACK_CONTENT_WIDTH / TRACK_CONTENT_HEIGHT
-       plus the border, since the panel's text is rendered to a fixed size. */
     #track {
         width: 62;
         height: 1fr;
@@ -1593,9 +1595,9 @@ def project_track(
     units first, because a cell is about twice as tall as it is wide. Without that
     conversion the track comes out squashed to half its true height.
 
-    The track therefore rarely fills the grid: an equal-aspect square circuit in a
-    38x12 box occupies about 24 columns. That whitespace is the price of an honest
-    shape, not a bug to be fixed by stretching.
+    The track therefore rarely fills the grid: an equal-aspect square circuit in
+    the 36x12 map region occupies about 24 columns. That whitespace is the price of
+    an honest shape, not a bug to be fixed by stretching.
     """
     cells: list[list[int | None]] = [[None] * width for _ in range(height)]
 

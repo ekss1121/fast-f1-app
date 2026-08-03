@@ -26,8 +26,6 @@ from fast_f1_app import (
     format_session_start,
     format_track_error,
     has_official_classification,
-    TRACK_GUTTER,
-    TRACK_TEXT_WIDTH,
     make_comparison_lap_time_graph,
     make_lap_time_graph,
     make_y_ticks,
@@ -38,6 +36,10 @@ from fast_f1_app import (
     select_clean_laps,
     to_plot_color,
     to_position,
+    TRACK_CONTENT_HEIGHT,
+    TRACK_CONTENT_WIDTH,
+    TRACK_GUTTER,
+    TRACK_TEXT_WIDTH,
 )
 
 
@@ -874,7 +876,7 @@ class TrackPanelTests(unittest.TestCase):
         return track
 
     def test_a_square_track_is_drawn_square(self):
-        panel = render_track_panel(self.square_track(), 60, 12)
+        panel = render_track_panel(self.square_track(), TRACK_CONTENT_WIDTH, TRACK_CONTENT_HEIGHT)
 
         cells = marker_cells(panel)
         columns = [column for _, column in cells]
@@ -887,12 +889,12 @@ class TrackPanelTests(unittest.TestCase):
         self.assertAlmostEqual(width, height * 2, delta=2)
 
     def test_drawn_points_stay_inside_the_map_region(self):
-        panel = render_track_panel(self.square_track(), 60, 12)
+        panel = render_track_panel(self.square_track(), TRACK_CONTENT_WIDTH, TRACK_CONTENT_HEIGHT)
 
         cells = marker_cells(panel)
         self.assertTrue(cells)
-        self.assertLess(max(column for _, column in cells), 60 - TRACK_TEXT_WIDTH - TRACK_GUTTER)
-        self.assertLess(max(row for row, _ in cells), 12)
+        self.assertLess(max(column for _, column in cells), TRACK_CONTENT_WIDTH - TRACK_TEXT_WIDTH - TRACK_GUTTER)
+        self.assertLess(max(row for row, _ in cells), TRACK_CONTENT_HEIGHT)
 
     def test_a_wide_track_keeps_clear_of_the_text_column(self):
         # A circuit far wider than it is tall fills the map region edge to edge,
@@ -902,10 +904,10 @@ class TrackPanelTests(unittest.TestCase):
             sectors=[1] * 200,
         )
 
-        panel = render_track_panel(wide, 60, 12)
+        panel = render_track_panel(wide, TRACK_CONTENT_WIDTH, TRACK_CONTENT_HEIGHT)
 
         for line in panel.plain.split("\n"):
-            gutter = line[60 - TRACK_TEXT_WIDTH - TRACK_GUTTER : 60 - TRACK_TEXT_WIDTH]
+            gutter = line[TRACK_CONTENT_WIDTH - TRACK_TEXT_WIDTH - TRACK_GUTTER : TRACK_CONTENT_WIDTH - TRACK_TEXT_WIDTH]
             self.assertEqual(gutter.strip(), "")
 
     def test_a_long_circuit_name_is_truncated_rather_than_wrapped(self):
@@ -914,15 +916,15 @@ class TrackPanelTests(unittest.TestCase):
             location="Spa-Francorchamps, Belgium",
         )
 
-        panel = render_track_panel(track, 60, 12)
+        panel = render_track_panel(track, TRACK_CONTENT_WIDTH, TRACK_CONTENT_HEIGHT)
 
         lines = panel.plain.split("\n")
-        self.assertEqual(len(lines), 12)
+        self.assertEqual(len(lines), TRACK_CONTENT_HEIGHT)
         for line in lines:
-            self.assertLessEqual(len(line), 60)
+            self.assertLessEqual(len(line), TRACK_CONTENT_WIDTH)
 
     def test_each_sector_is_drawn_in_its_own_colour(self):
-        panel = render_track_panel(self.square_track(), 60, 12)
+        panel = render_track_panel(self.square_track(), TRACK_CONTENT_WIDTH, TRACK_CONTENT_HEIGHT)
 
         # The legend contributes exactly one span per colour, so anything above
         # one is the map itself being coloured.
@@ -931,7 +933,7 @@ class TrackPanelTests(unittest.TestCase):
             self.assertGreater(counts.get(colour, 0), 1)
 
     def test_the_legend_names_all_three_sectors(self):
-        panel = render_track_panel(self.square_track(), 60, 12)
+        panel = render_track_panel(self.square_track(), TRACK_CONTENT_WIDTH, TRACK_CONTENT_HEIGHT)
 
         for sector in ("Sector 1", "Sector 2", "Sector 3"):
             self.assertIn(sector, panel.plain)
@@ -939,7 +941,7 @@ class TrackPanelTests(unittest.TestCase):
     def test_an_official_length_is_shown_plainly(self):
         track = self.square_track(length_m=4381.0, length_is_official=True)
 
-        panel = render_track_panel(track, 60, 12)
+        panel = render_track_panel(track, TRACK_CONTENT_WIDTH, TRACK_CONTENT_HEIGHT)
 
         self.assertIn("4381 m", panel.plain)
         self.assertNotIn("≈", panel.plain)
@@ -947,12 +949,12 @@ class TrackPanelTests(unittest.TestCase):
     def test_an_estimated_length_is_marked_approximate(self):
         track = self.square_track(length_m=3272.0, length_is_official=False)
 
-        panel = render_track_panel(track, 60, 12)
+        panel = render_track_panel(track, TRACK_CONTENT_WIDTH, TRACK_CONTENT_HEIGHT)
 
         self.assertIn("≈ 3272 m", panel.plain)
 
     def test_the_circuit_name_location_and_corner_count_are_shown(self):
-        panel = render_track_panel(self.square_track(), 60, 12)
+        panel = render_track_panel(self.square_track(), TRACK_CONTENT_WIDTH, TRACK_CONTENT_HEIGHT)
 
         self.assertIn("Hungaroring", panel.plain)
         self.assertIn("Budapest", panel.plain)
@@ -961,29 +963,29 @@ class TrackPanelTests(unittest.TestCase):
     def test_a_single_point_track_does_not_raise(self):
         track = self.square_track(points=[(10.0, 20.0)], sectors=[1])
 
-        panel = render_track_panel(track, 60, 12)
+        panel = render_track_panel(track, TRACK_CONTENT_WIDTH, TRACK_CONTENT_HEIGHT)
 
         self.assertEqual(len(marker_cells(panel)), 1)
 
     def test_identical_points_do_not_raise(self):
         track = self.square_track(points=[(5.0, 5.0)] * 20, sectors=[1] * 20)
 
-        panel = render_track_panel(track, 60, 12)
+        panel = render_track_panel(track, TRACK_CONTENT_WIDTH, TRACK_CONTENT_HEIGHT)
 
         self.assertEqual(len(marker_cells(panel)), 1)
 
     def test_a_track_without_points_still_renders_its_description(self):
         track = self.square_track(points=[], sectors=[])
 
-        panel = render_track_panel(track, 60, 12)
+        panel = render_track_panel(track, TRACK_CONTENT_WIDTH, TRACK_CONTENT_HEIGHT)
 
         self.assertEqual(marker_cells(panel), [])
         self.assertIn("Hungaroring", panel.plain)
 
     def test_the_panel_fills_the_requested_height(self):
-        panel = render_track_panel(self.square_track(), 60, 12)
+        panel = render_track_panel(self.square_track(), TRACK_CONTENT_WIDTH, TRACK_CONTENT_HEIGHT)
 
-        self.assertEqual(len(panel.plain.split("\n")), 12)
+        self.assertEqual(len(panel.plain.split("\n")), TRACK_CONTENT_HEIGHT)
 
     def test_the_track_error_says_it_retries_by_itself(self):
         message = format_track_error(ValueError("no completed lap to draw the circuit from"))
